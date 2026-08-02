@@ -26,15 +26,16 @@ Unauthorised users are **silently ignored** — no reply that would reveal the b
 
 Each candidate config goes through a **real connectivity test** before being accepted:
 
-1. The local Xray binary (installed by 3x-ui at `/usr/local/x-ui/bin/xray-linux-amd64`) is started with a temporary SOCKS5 inbound.
-2. An HTTP request is made through that SOCKS5 proxy to `https://api.ipify.org`.
-3. The returned IP is the **real exit IP** of the candidate server — even for Cloudflare-fronted configs, this reveals the true origin server IP.
-4. If the same exit IP was already seen (in existing slots or earlier in this run), the candidate is skipped.
+1. Candidates are tested **in parallel** (`XRAY_WORKERS`, default 5).
+2. For each candidate, the local Xray binary starts with a temporary SOCKS5 inbound.
+3. An HTTP request is made through that SOCKS5 proxy to `https://api.ipify.org`.
+4. The returned IP is the **real exit IP** of the candidate server — even for Cloudflare-fronted configs, this reveals the true origin server IP.
+5. If the same exit IP was already seen (in existing slots or earlier in this run), the candidate is skipped.
 
 This means:
 - Only candidates that **actually work** are accepted
 - No two slots will share the same origin server IP
-- The check is equivalent to what the 3x-ui panel's own test button does
+- Checks run in parallel for speed
 
 Fallback: set `XRAY_CHECK_ENABLED = False` in `config.py` to revert to a simple TCP latency check.
 
@@ -104,6 +105,7 @@ Use `/setup` in Telegram to change panel credentials at any time — the bot tes
 | `ALLOWED_USERS` | — | List of numeric Telegram user IDs |
 | `XRAY_CHECK_ENABLED` | `True` | Use Xray binary for real connectivity check |
 | `XRAY_BINARY` | `/usr/local/x-ui/bin/xray-linux-amd64` | Path to Xray binary |
+| `XRAY_WORKERS` | `5` | Number of parallel candidate checks |
 | `XRAY_STARTUP_WAIT_SEC` | `2.0` | Seconds to wait for Xray to start |
 | `XRAY_REQUEST_TIMEOUT_SEC` | `8` | HTTP request timeout through SOCKS5 |
 | `CANDIDATES_TO_FETCH` | `80` | How many candidates to pull from source per run |
@@ -125,10 +127,17 @@ Use `/setup` in Telegram to change panel credentials at any time — the bot tes
 
 ## Performance
 
-With `XRAY_CHECK_ENABLED = True`, each candidate takes ~3–10 seconds to test.
-Typical times: `/fill 5` ≈ 30–60s, `/fill 10` ≈ 1–2 min, `/checkall` (10 slots) ≈ 2–3 min.
+With `XRAY_WORKERS = 5` (default):
 
-If speed matters more than accuracy, set `XRAY_CHECK_ENABLED = False` for instant TCP-only checks.
+| Operation | Time |
+|---|---|
+| `/fill 5` | ~8–15s |
+| `/fill 10` | ~15–25s |
+| `/checkall` (10 slots) | ~10–20s |
+
+With `XRAY_CHECK_ENABLED = False` (TCP fallback): all operations complete in under 5 seconds.
+
+To increase speed further, raise `XRAY_WORKERS` (recommended max: 10 for servers with 2GB+ RAM).
 
 ---
 
@@ -171,7 +180,7 @@ The VLESS outbound settings use the **flat format** expected by the 3x-ui panel 
 bot.py              — Telegram bot (all command handlers)
 panel_client.py     — 3x-ui panel API client (login, read, save)
 converter.py        — subscription link parser (vless/vmess/trojan/ss)
-ipcheck.py          — real connectivity check via Xray binary + exit IP dedup
+ipcheck.py          — real connectivity check via Xray binary + exit IP
 healthcheck.py      — TCP latency check (fallback when XRAY_CHECK_ENABLED=False)
 scraper.py          — fetch candidate configs from GitHub raw source
 merger.py           — merge outbounds into Xray config dict
