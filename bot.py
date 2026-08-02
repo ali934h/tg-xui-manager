@@ -10,17 +10,18 @@ Commands
 /status        List all managed slots (address / port / protocol).
 /setup         Interactive wizard to change panel URL, username, and password.
 
-Candidate evaluation pipeline (per candidate):
-  1. Parse the subscription link (converter.py)
-  2. If XRAY_CHECK_ENABLED: run a real HTTP request through the Xray binary
-     (ipcheck.py) and get the exit IP. Skip if IP is already seen.
-  3. If XRAY_CHECK_ENABLED is False: fall back to TCP latency check (healthcheck.py)
-     and skip if address string is duplicate.
+Candidate evaluation pipeline:
+  1. Parse all candidate links (converter.py)
+  2. If XRAY_CHECK_ENABLED: test XRAY_WORKERS candidates in parallel via Xray binary
+     (ipcheck.py), collect exit IPs, deduplicate.
+  3. If XRAY_CHECK_ENABLED is False: fall back to serial TCP latency check.
 """
 
 import logging
 import re
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from telegram import BotCommand, Update
 from telegram.ext import (
@@ -126,7 +127,7 @@ def _managed_slots(xray_cfg: dict) -> list[dict]:
 
 
 def _current_ips(xray_cfg: dict) -> set[str]:
-    """Collect addresses of existing managed slots (used for address-based dedup fallback)."""
+    """Collect addresses of existing managed slots for dedup."""
     addrs: set[str] = set()
     for ob in _managed_slots(xray_cfg):
         proto = ob.get("protocol", "")
@@ -146,52 +147,115 @@ def _address_of(outbound: dict) -> str | None:
     return outbound.get("_meta", {}).get("address")
 
 
-def _fetch_next_candidate(
-    existing_keys: set[str],
-    used_this_run: set[str],
+# ---------------------------------------------------------------------------
+# Parallel candidate fetching (Xray mode)
+# ---------------------------------------------------------------------------
+
+def _check_one(ob: dict, existing_keys: set[str]) -> tuple[dict, str] | None:
+    """
+    Worker function: run ipcheck on a single outbound.
+    Returns (outbound, exit_ip) if healthy and not in existing_keys, else None.
+    existing_keys is read-only here — used_this_run dedup is done in the caller.
+    """
+    exit_ip = ipcheck.check_outbound(ob)
+    if exit_ip is None:
+        return None
+    if exit_ip in existing_keys:
+        logger.info("Skipping duplicate exit IP (existing slot): %s", exit_ip)
+        return None
+    return (ob, exit_ip)
+
+
+def _collect_candidates_parallel(
     candidates: list[str],
-    cursor: list[int],
-) -> dict | None:
+    needed: int,
+    existing_keys: set[str],
+) -> list[tuple[dict, str]]:
     """
-    Walk candidates from cursor position.
-    Each candidate is:
-      - parsed
-      - checked via Xray binary (real HTTP request) if XRAY_CHECK_ENABLED
-        OR via TCP latency if disabled
-      - deduplicated by exit IP (xray mode) or address string (tcp mode)
+    Parse and test candidates in parallel using ThreadPoolExecutor.
+    Returns a list of (outbound, exit_ip) tuples, deduplicated by exit IP,
+    up to `needed` results.
 
-    Returns the first passing candidate or None if list is exhausted.
+    Workers: XRAY_WORKERS from config (default 5).
+    Batch strategy: submit XRAY_WORKERS * 2 candidates at a time, collect
+    results as they arrive, stop when we have enough.
     """
-    use_xray = getattr(config, "XRAY_CHECK_ENABLED", True)
+    workers = getattr(config, "XRAY_WORKERS", 5)
+    results: list[tuple[dict, str]] = []
+    seen_ips: set[str] = set()  # dedup within this run
+    lock = threading.Lock()
 
-    while cursor[0] < len(candidates):
-        link = candidates[cursor[0]]
-        cursor[0] += 1
+    # Parse all candidate links first (fast, no I/O)
+    parsed: list[dict] = []
+    for link in candidates:
+        ob = converter.parse_link(link)
+        if ob is not None:
+            parsed.append(ob)
 
+    if not parsed:
+        return []
+
+    # Submit in batches to avoid spawning all at once
+    batch_size = workers * 3
+    idx = 0
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        while idx < len(parsed) and len(results) < needed:
+            batch = parsed[idx: idx + batch_size]
+            idx += batch_size
+
+            futures = {executor.submit(_check_one, ob, existing_keys): ob for ob in batch}
+
+            for future in as_completed(futures):
+                if len(results) >= needed:
+                    # Cancel remaining futures (best effort)
+                    for f in futures:
+                        f.cancel()
+                    break
+                result = future.result()
+                if result is None:
+                    continue
+                ob, exit_ip = result
+                with lock:
+                    if exit_ip in seen_ips:
+                        logger.info("Skipping duplicate exit IP (this run): %s", exit_ip)
+                        continue
+                    seen_ips.add(exit_ip)
+                    results.append((ob, exit_ip))
+
+    return results[:needed]
+
+
+# ---------------------------------------------------------------------------
+# Serial candidate fetching (TCP fallback mode)
+# ---------------------------------------------------------------------------
+
+def _collect_candidates_serial(
+    candidates: list[str],
+    needed: int,
+    existing_keys: set[str],
+) -> list[dict]:
+    """Serial TCP-based candidate collection (fallback when XRAY_CHECK_ENABLED=False)."""
+    results: list[dict] = []
+    used: set[str] = set()
+
+    for link in candidates:
+        if len(results) >= needed:
+            break
         ob = converter.parse_link(link)
         if ob is None:
             continue
+        addr = _address_of(ob)
+        if addr and (addr in existing_keys or addr in used):
+            logger.info("Skipping duplicate address: %s", addr)
+            continue
+        if not healthcheck.is_healthy(ob):
+            continue
+        if addr:
+            used.add(addr)
+        results.append(ob)
 
-        if use_xray:
-            exit_ip = ipcheck.check_outbound(ob)
-            if exit_ip is None:
-                continue
-            if exit_ip in existing_keys or exit_ip in used_this_run:
-                logger.info("Skipping duplicate exit IP: %s", exit_ip)
-                continue
-            used_this_run.add(exit_ip)
-        else:
-            addr = _address_of(ob)
-            if addr and (addr in existing_keys or addr in used_this_run):
-                logger.info("Skipping duplicate address: %s", addr)
-                continue
-            if not healthcheck.is_healthy(ob):
-                continue
-            if addr:
-                used_this_run.add(addr)
-
-        return ob
-    return None
+    return results
 
 
 def _get_panel() -> panel_client.PanelClient:
@@ -217,8 +281,9 @@ async def cmd_fill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     use_xray = getattr(config, "XRAY_CHECK_ENABLED", True)
-    mode_note = "real connectivity check" if use_xray else "TCP latency check"
-    await update.message.reply_text(f"\u23f3 Filling {n} slot(s) using {mode_note}\u2026")
+    workers = getattr(config, "XRAY_WORKERS", 5)
+    mode_note = f"real connectivity check, {workers} parallel workers" if use_xray else "TCP latency check"
+    await update.message.reply_text(f"\u23f3 Filling {n} slot(s) \u2014 {mode_note}\u2026")
 
     try:
         client = _get_panel()
@@ -234,17 +299,14 @@ async def cmd_fill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u274c Could not fetch candidates from source.")
         return
 
-    cursor = [0]
-    used_this_run: set[str] = set()
-    tag_to_outbound: dict[str, dict] = {}
-    failed_slots: list[int] = []
-
-    for i in range(1, n + 1):
-        ob = _fetch_next_candidate(existing_keys, used_this_run, candidates, cursor)
-        if ob is None:
-            failed_slots.append(i)
-        else:
-            tag_to_outbound[_slot_tag(i)] = ob
+    if use_xray:
+        found = _collect_candidates_parallel(candidates, needed=n, existing_keys=existing_keys)
+        tag_to_outbound = {_slot_tag(i + 1): ob for i, (ob, _) in enumerate(found)}
+        failed_slots = list(range(len(found) + 1, n + 1)) if len(found) < n else []
+    else:
+        found_obs = _collect_candidates_serial(candidates, needed=n, existing_keys=existing_keys)
+        tag_to_outbound = {_slot_tag(i + 1): ob for i, ob in enumerate(found_obs)}
+        failed_slots = list(range(len(found_obs) + 1, n + 1)) if len(found_obs) < n else []
 
     if tag_to_outbound:
         xray_cfg = merger.replace_outbounds(xray_cfg, tag_to_outbound)
@@ -278,7 +340,11 @@ async def cmd_replace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Usage: /replace <slot numbers>\nExample: /replace 1,5,8")
         return
 
-    await update.message.reply_text(f"\u23f3 Replacing slot(s): {slot_numbers}\u2026")
+    n = len(slot_numbers)
+    use_xray = getattr(config, "XRAY_CHECK_ENABLED", True)
+    workers = getattr(config, "XRAY_WORKERS", 5)
+    mode_note = f"real connectivity check, {workers} parallel workers" if use_xray else "TCP latency check"
+    await update.message.reply_text(f"\u23f3 Replacing slot(s) {slot_numbers} \u2014 {mode_note}\u2026")
 
     try:
         client = _get_panel()
@@ -294,17 +360,14 @@ async def cmd_replace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("\u274c Could not fetch candidates from source.")
         return
 
-    cursor = [0]
-    used_this_run: set[str] = set()
-    tag_to_outbound: dict[str, dict] = {}
-    failed_slots: list[int] = []
-
-    for i in slot_numbers:
-        ob = _fetch_next_candidate(existing_keys, used_this_run, candidates, cursor)
-        if ob is None:
-            failed_slots.append(i)
-        else:
-            tag_to_outbound[_slot_tag(i)] = ob
+    if use_xray:
+        found = _collect_candidates_parallel(candidates, needed=n, existing_keys=existing_keys)
+        tag_to_outbound = {_slot_tag(slot_numbers[i]): ob for i, (ob, _) in enumerate(found)}
+        failed_slots = [slot_numbers[i] for i in range(len(found), n)]
+    else:
+        found_obs = _collect_candidates_serial(candidates, needed=n, existing_keys=existing_keys)
+        tag_to_outbound = {_slot_tag(slot_numbers[i]): ob for i, ob in enumerate(found_obs)}
+        failed_slots = [slot_numbers[i] for i in range(len(found_obs), n)]
 
     if tag_to_outbound:
         xray_cfg = merger.replace_outbounds(xray_cfg, tag_to_outbound)
@@ -333,7 +396,8 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return await _reject(update)
 
     use_xray = getattr(config, "XRAY_CHECK_ENABLED", True)
-    mode_note = "real connectivity check" if use_xray else "TCP latency check"
+    workers = getattr(config, "XRAY_WORKERS", 5)
+    mode_note = f"real connectivity check, {workers} parallel workers" if use_xray else "TCP latency check"
     await update.message.reply_text(f"\u23f3 Checking all managed slots ({mode_note})\u2026")
 
     try:
@@ -349,41 +413,60 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("No managed slots found on panel.")
         return
 
+    # Check existing slots (also parallel in xray mode)
     failed_tags: list[str] = []
     seen_ips: set[str] = set()
 
-    for ob in managed:
-        tag = ob.get("tag", "")
-        proto = ob.get("protocol", "")
-        try:
-            if proto == "vless":
-                addr = ob["settings"]["address"]
-                port = ob["settings"]["port"]
-            elif proto == "vmess":
-                addr = ob["settings"]["vnext"][0]["address"]
-                port = ob["settings"]["vnext"][0]["port"]
-            elif proto in ("trojan", "shadowsocks"):
-                addr = ob["settings"]["servers"][0]["address"]
-                port = ob["settings"]["servers"][0]["port"]
-            else:
+    if use_xray:
+        # Build synthetic outbounds for existing slots and check them in parallel
+        slot_obs: list[tuple[str, dict]] = []  # (tag, outbound_with_meta)
+        for ob in managed:
+            tag = ob.get("tag", "")
+            proto = ob.get("protocol", "")
+            try:
+                if proto == "vless":
+                    addr, port = ob["settings"]["address"], ob["settings"]["port"]
+                elif proto == "vmess":
+                    addr, port = ob["settings"]["vnext"][0]["address"], ob["settings"]["vnext"][0]["port"]
+                elif proto in ("trojan", "shadowsocks"):
+                    addr, port = ob["settings"]["servers"][0]["address"], ob["settings"]["servers"][0]["port"]
+                else:
+                    failed_tags.append(tag)
+                    continue
+            except (KeyError, IndexError):
                 failed_tags.append(tag)
                 continue
-        except (KeyError, IndexError):
-            failed_tags.append(tag)
-            continue
-
-        if use_xray:
-            # Build a synthetic outbound with _meta for ipcheck
             check_ob = dict(ob)
             check_ob["_meta"] = {"address": addr, "port": port}
-            exit_ip = ipcheck.check_outbound(check_ob)
-            if exit_ip is None:
+            slot_obs.append((tag, check_ob))
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_tag = {executor.submit(ipcheck.check_outbound, ob): tag for tag, ob in slot_obs}
+            for future in as_completed(future_to_tag):
+                tag = future_to_tag[future]
+                exit_ip = future.result()
+                if exit_ip is None:
+                    failed_tags.append(tag)
+                else:
+                    seen_ips.add(exit_ip)
+    else:
+        for ob in managed:
+            tag = ob.get("tag", "")
+            proto = ob.get("protocol", "")
+            try:
+                if proto == "vless":
+                    addr, port = ob["settings"]["address"], ob["settings"]["port"]
+                elif proto == "vmess":
+                    addr, port = ob["settings"]["vnext"][0]["address"], ob["settings"]["vnext"][0]["port"]
+                elif proto in ("trojan", "shadowsocks"):
+                    addr, port = ob["settings"]["servers"][0]["address"], ob["settings"]["servers"][0]["port"]
+                else:
+                    failed_tags.append(tag)
+                    continue
+            except (KeyError, IndexError):
                 failed_tags.append(tag)
-            else:
-                seen_ips.add(exit_ip)
-        else:
-            synthetic = {"_meta": {"address": addr, "port": port}}
-            if not healthcheck.is_healthy(synthetic):
+                continue
+            if not healthcheck.is_healthy({"_meta": {"address": addr, "port": port}}):
                 failed_tags.append(tag)
 
     if not failed_tags:
@@ -400,17 +483,15 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("\u274c Could not fetch candidates from source.")
         return
 
-    cursor = [0]
-    used_this_run: set[str] = set()
-    tag_to_outbound: dict[str, dict] = {}
-    still_failed: list[str] = []
-
-    for tag in failed_tags:
-        ob = _fetch_next_candidate(existing_keys, used_this_run, candidates, cursor)
-        if ob is None:
-            still_failed.append(tag)
-        else:
-            tag_to_outbound[tag] = ob
+    n = len(failed_tags)
+    if use_xray:
+        found = _collect_candidates_parallel(candidates, needed=n, existing_keys=existing_keys)
+        tag_to_outbound = {failed_tags[i]: ob for i, (ob, _) in enumerate(found)}
+        still_failed = [failed_tags[i] for i in range(len(found), n)]
+    else:
+        found_obs = _collect_candidates_serial(candidates, needed=n, existing_keys=existing_keys)
+        tag_to_outbound = {failed_tags[i]: ob for i, ob in enumerate(found_obs)}
+        still_failed = [failed_tags[i] for i in range(len(found_obs), n)]
 
     if tag_to_outbound:
         xray_cfg = merger.replace_outbounds(xray_cfg, tag_to_outbound)

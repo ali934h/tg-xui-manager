@@ -24,16 +24,21 @@ SLOT_TAG_PREFIX = "out"    # -> out01, out02, ...
 SLOT_TAG_DIGITS = 2
 
 # ---------- Candidate Check ----------
-# XRAY_CHECK: use the local Xray binary to make a real HTTP request through
-# each candidate and verify connectivity + get the real exit IP.
-# This is slower but far more accurate than TCP-only check.
-# Set to False to fall back to TCP latency check only.
+# XRAY_CHECK_ENABLED: use the local Xray binary to make a real HTTP request
+# through each candidate and verify connectivity + get the real exit IP.
+# Requires 3x-ui to be installed on the same server (provides the binary).
+# Set to False to fall back to TCP latency check only (faster but less accurate).
 XRAY_CHECK_ENABLED = True
 
-# Xray binary path (installed by 3x-ui at this location)
+# Path to Xray binary (installed by 3x-ui)
 XRAY_BINARY = "/usr/local/x-ui/bin/xray-linux-amd64"
 
-# Seconds to wait for the Xray process to start before sending traffic
+# How many candidates to test in parallel.
+# Higher = faster, but uses more RAM and CPU.
+# Recommended: 3-5 for servers with 1GB RAM, up to 10 for 2GB+.
+XRAY_WORKERS = 5
+
+# Seconds to wait for Xray process to start before sending traffic
 XRAY_STARTUP_WAIT_SEC = 2.0
 
 # HTTP request timeout (seconds) when checking through SOCKS5
