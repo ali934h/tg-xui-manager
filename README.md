@@ -3,7 +3,7 @@
 Telegram bot to manage outbounds on a [3x-ui](https://github.com/MHSanaei/3x-ui) panel.
 Replaces stale or failed outbounds with healthy free configs fetched from a public V2Ray list — all on demand, via Telegram commands. No scheduler, no cron, no automatic rotation.
 
-> **Tested on:** 3x-ui v2.9.3 · Ubuntu 22.04 / 24.04 · Python 3.10+
+> **Tested on:** 3x-ui v2.9.3 · Xray 26.4.25 · Ubuntu 22.04 / 24.04 · Python 3.10+
 
 ---
 
@@ -11,9 +11,9 @@ Replaces stale or failed outbounds with healthy free configs fetched from a publ
 
 | Command | Description |
 |---|---|
-| `/fill N` | Fill slots `out01`…`out0N` with healthy, non-duplicate candidates |
-| `/replace 1,5,8` | Force-replace specific slot numbers (skips health check) |
-| `/checkall` | TCP-health-check every managed slot; replace only the failed ones |
+| `/fill N` | Fill slots `out01`…`out0N` with verified, non-duplicate candidates |
+| `/replace 1,5,8` | Force-replace specific slot numbers |
+| `/checkall` | Check every managed slot; replace only the failed ones |
 | `/status` | List all managed slots with address / port / protocol |
 | `/setup` | Interactive wizard to change panel credentials |
 | `/help` | Show all commands |
@@ -22,14 +22,30 @@ Unauthorised users are **silently ignored** — no reply that would reveal the b
 
 ---
 
+## How candidate verification works
+
+Each candidate config goes through a **real connectivity test** before being accepted:
+
+1. The local Xray binary (installed by 3x-ui at `/usr/local/x-ui/bin/xray-linux-amd64`) is started with a temporary SOCKS5 inbound.
+2. An HTTP request is made through that SOCKS5 proxy to `https://api.ipify.org`.
+3. The returned IP is the **real exit IP** of the candidate server — even for Cloudflare-fronted configs, this reveals the true origin server IP.
+4. If the same exit IP was already seen (in existing slots or earlier in this run), the candidate is skipped.
+
+This means:
+- Only candidates that **actually work** are accepted
+- No two slots will share the same origin server IP
+- The check is equivalent to what the 3x-ui panel's own test button does
+
+Fallback: set `XRAY_CHECK_ENABLED = False` in `config.py` to revert to a simple TCP latency check.
+
+---
+
 ## Requirements
 
 - Ubuntu 22.04 / 24.04 VPS with root access
-- 3x-ui panel already installed on the **same server**
+- **3x-ui panel already installed on the same server** (provides the Xray binary)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - Your numeric Telegram user ID (ask [@userinfobot](https://t.me/userinfobot))
-
-> Xray binary is available automatically since 3x-ui installs it.
 
 ---
 
@@ -86,11 +102,15 @@ Use `/setup` in Telegram to change panel credentials at any time — the bot tes
 | `PANEL_PASSWORD` | — | Panel login password |
 | `BOT_TOKEN` | — | Telegram bot token |
 | `ALLOWED_USERS` | — | List of numeric Telegram user IDs |
-| `MAX_LATENCY_MS` | `350` | TCP latency threshold for health checks |
-| `TCP_CONNECT_TIMEOUT_SEC` | `4` | Connection timeout per check |
+| `XRAY_CHECK_ENABLED` | `True` | Use Xray binary for real connectivity check |
+| `XRAY_BINARY` | `/usr/local/x-ui/bin/xray-linux-amd64` | Path to Xray binary |
+| `XRAY_STARTUP_WAIT_SEC` | `2.0` | Seconds to wait for Xray to start |
+| `XRAY_REQUEST_TIMEOUT_SEC` | `8` | HTTP request timeout through SOCKS5 |
 | `CANDIDATES_TO_FETCH` | `80` | How many candidates to pull from source per run |
 | `SLOT_TAG_PREFIX` | `out` | Tag prefix — `out` → `out01`, `out02`, … |
 | `SLOT_TAG_DIGITS` | `2` | Zero-padding width |
+| `MAX_LATENCY_MS` | `350` | TCP latency threshold (fallback mode only) |
+| `TCP_CONNECT_TIMEOUT_SEC` | `4` | TCP timeout (fallback mode only) |
 
 ---
 
@@ -99,7 +119,16 @@ Use `/setup` in Telegram to change panel credentials at any time — the bot tes
 - The bot manages outbounds whose tags match `out01`…`out99` (configurable prefix/digits).
 - `/fill N` fills slots 1 through N — creates them if missing, replaces if present.
 - `/checkall` only checks slots that **currently exist** on the panel. Manually deleted slots are not detected — use `/fill N` or `/replace N` to recreate them.
-- Duplicate detection is based on `address` string match within a single run.
+- Duplicate detection is based on **real exit IP** (Xray mode) or address string (fallback mode).
+
+---
+
+## Performance
+
+With `XRAY_CHECK_ENABLED = True`, each candidate takes ~3–10 seconds to test.
+Typical times: `/fill 5` ≈ 30–60s, `/fill 10` ≈ 1–2 min, `/checkall` (10 slots) ≈ 2–3 min.
+
+If speed matters more than accuracy, set `XRAY_CHECK_ENABLED = False` for instant TCP-only checks.
 
 ---
 
@@ -114,7 +143,7 @@ Supported protocols: `vless`, `vmess`, `trojan`, `shadowsocks`.
 
 ## Panel API compatibility
 
-Verified against **3x-ui v2.9.3**. The bot uses:
+Verified against **3x-ui v2.9.3** and **Xray 26.4.25**. The bot uses:
 
 | Endpoint | Method | Purpose |
 |---|---|---|
@@ -123,6 +152,8 @@ Verified against **3x-ui v2.9.3**. The bot uses:
 | `{base}/panel/xray/update` | POST (form-urlencoded) | Save Xray config |
 
 The VLESS outbound settings use the **flat format** expected by the 3x-ui panel (`address`, `port`, `id`, `flow`, `encryption`) — not the Xray core `vnext` format.
+
+> **Xray 26.x note:** `allowInsecure` was removed from `tlsSettings` in Xray 26.x. The bot never includes this field in generated configs.
 
 ---
 
@@ -140,7 +171,8 @@ The VLESS outbound settings use the **flat format** expected by the 3x-ui panel 
 bot.py              — Telegram bot (all command handlers)
 panel_client.py     — 3x-ui panel API client (login, read, save)
 converter.py        — subscription link parser (vless/vmess/trojan/ss)
-healthcheck.py      — TCP latency health check
+ipcheck.py          — real connectivity check via Xray binary + exit IP dedup
+healthcheck.py      — TCP latency check (fallback when XRAY_CHECK_ENABLED=False)
 scraper.py          — fetch candidate configs from GitHub raw source
 merger.py           — merge outbounds into Xray config dict
 config.example.py   — template (copy to config.py and fill in values)

@@ -6,19 +6,21 @@ This document is written for an AI assistant (or developer) taking over this pro
 
 ## Project summary
 
-`tg-xui-manager` is a **Telegram bot** that manages the outbound section of a [3x-ui](https://github.com/MHSanaei/3x-ui) Xray panel. It fetches free V2Ray/Trojan/SS configs from a public GitHub source, health-checks them via TCP connect, and pushes healthy ones into the panel's Xray config — all triggered by Telegram commands.
+`tg-xui-manager` is a **Telegram bot** that manages the outbound section of a [3x-ui](https://github.com/MHSanaei/3x-ui) Xray panel. It fetches free V2Ray/Trojan/SS configs from a public GitHub source, verifies each one by making a real HTTP request through the local Xray binary, and pushes verified, deduplicated configs into the panel — all triggered by Telegram commands.
 
-**Stack:** Python 3.10+, `python-telegram-bot` v20+, `requests`, `systemd` on Ubuntu.
+**Stack:** Python 3.10+, `python-telegram-bot` v20+, `requests`, `PySocks`, `curl`, `systemd` on Ubuntu.
+**Tested on:** 3x-ui v2.9.3, Xray 26.4.25, Ubuntu 22.04/24.04.
 
 ---
 
 ## Repository layout
 
 ```
-bot.py              Entry point. All Telegram command handlers live here.
+bot.py              Entry point. All Telegram command handlers.
 panel_client.py     HTTP client for the 3x-ui panel API.
-converter.py        Parses vless/vmess/trojan/ss subscription links into outbound dicts.
-healthcheck.py      TCP connect latency check.
+converter.py        Parses vless/vmess/trojan/ss links into outbound dicts.
+ipcheck.py          Real connectivity check via Xray binary; returns exit IP.
+healthcheck.py      TCP connect latency check (fallback only).
 scraper.py          Downloads candidate config list from GitHub raw.
 merger.py           Merges outbound dicts into the full Xray config.
 config.example.py   Template for config.py (never committed).
@@ -41,28 +43,51 @@ bot.py  (python-telegram-bot polling)
     │
     ├── scraper.py        → downloads V2RAY.txt from roosterkid/openproxylist
     ├── converter.py      → parses each link into an outbound dict
-    ├── healthcheck.py    → TCP connect to address:port, measures latency
+    ├── ipcheck.py        → starts Xray, connects through it, gets exit IP
+    ├── healthcheck.py    → TCP connect fallback (when XRAY_CHECK_ENABLED=False)
     ├── merger.py         → inserts/replaces outbounds in the Xray config dict
     └── panel_client.py   → login + read + save via 3x-ui HTTP API
 ```
 
-No database, no scheduler. Everything is triggered by a Telegram command and runs synchronously inside the async handler.
+No database, no scheduler. Everything is triggered by a Telegram command.
+
+---
+
+## Candidate evaluation pipeline
+
+For each candidate link from the source list:
+
+1. **Parse** (`converter.py`) — extract protocol, address, port, settings into an outbound dict.
+2. **Xray check** (`ipcheck.py`, when `XRAY_CHECK_ENABLED=True`):
+   - Find a free local port.
+   - Write a temp Xray config: SOCKS5 inbound on that port → candidate outbound.
+   - Spawn `/usr/local/x-ui/bin/xray-linux-amd64 -c /tmp/tmpXXX.json`.
+   - Wait `XRAY_STARTUP_WAIT_SEC` seconds.
+   - Run `curl -s --max-time 8 --proxy socks5h://127.0.0.1:{port} https://api.ipify.org`.
+   - If curl returns a valid IPv4 → candidate is alive; the IP is the **real origin server IP**.
+   - Terminate xray subprocess and delete temp file.
+3. **Dedup** — if the exit IP matches any existing slot or any earlier candidate in this run → skip.
+4. **Accept** — add to `tag_to_outbound` map for this run.
+
+Fallback (TCP mode, `XRAY_CHECK_ENABLED=False`):
+- TCP connect to `address:port`, measure latency.
+- Skip if latency > `MAX_LATENCY_MS` or address string already seen.
 
 ---
 
 ## Panel API (3x-ui v2.9.3)
 
-Verified with DevTools on a real panel. All endpoints are relative to `PANEL_BASE_URL`.
+All endpoints are relative to `PANEL_BASE_URL`.
 
 | Endpoint | Method | Content-Type | Notes |
 |---|---|---|---|
 | `/login` | POST | form | Fields: `username`, `password` |
-| `/panel/xray` | POST | — | Returns `{success, obj: "<json string>"}`. `obj` is a JSON string containing `{xraySetting: {...}, outboundTestUrl: "..."}` |
-| `/panel/xray/update` | POST | `application/x-www-form-urlencoded` | Fields: `xraySetting=<json string>`, `outboundTestUrl=<url>` |
+| `/panel/xray` | POST | — | Returns `{success, obj: "<json string>"}`. `obj` contains `{xraySetting: {...}, outboundTestUrl: "..."}` |
+| `/panel/xray/update` | POST | `application/x-www-form-urlencoded` | Fields: `xraySetting=<json>`, `outboundTestUrl=<url>` |
 
-**Critical:** The save endpoint is `form-urlencoded`, NOT `application/json`. This was verified with raw DevTools capture. Sending JSON body causes a panel validation error.
+**Critical:** Save endpoint must be `form-urlencoded`, NOT `application/json`. Sending JSON body causes a panel validation error (verified with DevTools).
 
-**`outboundTestUrl`** must be included in the save request or the panel rejects it. `panel_client.py` caches it from the read response.
+**`outboundTestUrl`** must be included in every save request. `panel_client.py` caches it from the read response.
 
 ---
 
@@ -85,18 +110,15 @@ Verified from `web/assets/js/model/outbound.js` in 3x-ui v2.9.3 source.
   "tag": "out01"
 }
 ```
-> ⚠️ The Xray core spec uses `vnext`, but 3x-ui's panel UI uses a flat structure. Using `vnext` causes the panel form to show `undefined:undefined` for address/port.
+> ⚠️ The Xray core spec uses `vnext`, but 3x-ui panel UI uses flat structure. Using `vnext` causes `undefined:undefined` in the panel form.
 
 ### VMess — vnext format
 ```json
 {
   "protocol": "vmess",
   "settings": {
-    "vnext": [{
-      "address": "1.2.3.4",
-      "port": 443,
-      "users": [{"id": "uuid", "alterId": 0, "security": "auto"}]
-    }]
+    "vnext": [{"address": "1.2.3.4", "port": 443,
+      "users": [{"id": "uuid", "alterId": 0, "security": "auto"}]}]
   },
   "streamSettings": { ... },
   "tag": "out02"
@@ -107,9 +129,7 @@ Verified from `web/assets/js/model/outbound.js` in 3x-ui v2.9.3 source.
 ```json
 {
   "protocol": "trojan",
-  "settings": {
-    "servers": [{"address": "1.2.3.4", "port": 443, "password": "..."}]
-  },
+  "settings": {"servers": [{"address": "1.2.3.4", "port": 443, "password": "..."}]},
   "streamSettings": { ... },
   "tag": "out03"
 }
@@ -119,9 +139,7 @@ Verified from `web/assets/js/model/outbound.js` in 3x-ui v2.9.3 source.
 ```json
 {
   "protocol": "shadowsocks",
-  "settings": {
-    "servers": [{"address": "1.2.3.4", "port": 8388, "method": "aes-256-gcm", "password": "..."}]
-  },
+  "settings": {"servers": [{"address": "1.2.3.4", "port": 8388, "method": "aes-256-gcm", "password": "..."}]},
   "streamSettings": {"network": "tcp", "security": "none"},
   "tag": "out04"
 }
@@ -129,46 +147,47 @@ Verified from `web/assets/js/model/outbound.js` in 3x-ui v2.9.3 source.
 
 ---
 
+## Xray 26.x compatibility
+
+**`allowInsecure` was removed** from `tlsSettings` in Xray 26.x. Including it causes:
+```
+Failed to start: ... The feature "allowInsecure" has been removed
+```
+`converter.py` intentionally omits this field. Never add it back.
+
+Xray binary path on this server: `/usr/local/x-ui/bin/xray-linux-amd64`
+
+---
+
 ## Slot system
 
-- Slots are outbounds whose tags match the regex `^out\d{2}$` (e.g. `out01`…`out99`).
-- Prefix and digit count are configurable via `SLOT_TAG_PREFIX` and `SLOT_TAG_DIGITS` in `config.py`.
+- Slots are outbounds whose tags match `^out\d{2}$` (e.g. `out01`…`out99`).
+- Prefix/digits configurable via `SLOT_TAG_PREFIX` / `SLOT_TAG_DIGITS`.
 - `merger.slot_tag(n)` generates the canonical tag string.
-- `/fill N` creates/replaces slots 1 through N.
-- `/replace 1,5,8` replaces only the specified slot numbers.
-- `/checkall` reads existing slots from the panel, TCP-checks each one, replaces failed ones.
-- **Manually deleted slots** are invisible to `/checkall` — use `/fill` or `/replace` to recreate.
+- `/fill N` — creates/replaces slots 1 through N.
+- `/replace 1,5,8` — replaces only specified slot numbers.
+- `/checkall` — reads existing slots, tests each via Xray, replaces failed ones.
+- **Manually deleted slots are invisible to `/checkall`** — use `/fill` or `/replace` to recreate.
 
 ---
 
 ## Duplicate detection
 
-Currently based on **address string match** within a single run:
-- Before accepting a candidate, the bot checks if its `address` is already used by an existing managed slot OR was already picked in the current run.
-- This works for direct IPs and non-CDN domains.
-- For Cloudflare-proxied domains: the `address` in the link is the Cloudflare entry point, not the origin IP. Address-string dedup still avoids exact duplicates but cannot detect different domains pointing to the same origin.
+**Xray mode (default):** dedup by **real exit IP**.
+- For CDN-fronted configs (Cloudflare, etc.): the exit IP is the origin server IP, not the CDN edge. This is because traffic exits from the 3x-ui server through the CDN tunnel to the origin.
+- Exit IPs seen in existing slots and earlier in the current run are both tracked.
 
-**Planned improvement:** Use the Xray binary (already installed by 3x-ui) to actually connect through each candidate and fetch the exit IP from `https://api.ipify.org`. This gives the real origin IP and enables true dedup.
+**TCP mode (fallback):** dedup by **address string** — less accurate, can miss two different domains pointing to the same server.
 
 ---
 
 ## Config source
 
 - URL: `https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY.txt`
-- Updated hourly by the source repo.
-- Format: one config link per line, prefixed with a flag emoji and suffixed with latency/country info.
-- Regex extracts the link: `((?:vless|vmess|trojan|ss)://\S+)`
-- `CANDIDATES_TO_FETCH` (default 80) controls how many lines are read before stopping.
-
----
-
-## Health check
-
-- Simple TCP `connect()` to `address:port`.
-- Threshold: `MAX_LATENCY_MS` (default 350ms).
-- Timeout: `TCP_CONNECT_TIMEOUT_SEC` (default 4s).
-- The check uses `_meta.address` and `_meta.port` which `converter.py` attaches to every outbound dict.
-- `merger.py` strips `_meta` before sending to the panel.
+- Updated hourly.
+- Format: one link per line, prefixed with flag emoji and suffixed with latency/country.
+- Regex: `((?:vless|vmess|trojan|ss)://\S+)`
+- `CANDIDATES_TO_FETCH` (default 80) controls how many lines are read.
 
 ---
 
@@ -176,43 +195,49 @@ Currently based on **address string match** within a single run:
 
 | Command | Handler | Behaviour |
 |---|---|---|
-| `/start` | `cmd_start` | Shows help text |
-| `/help` | `cmd_help` | Shows help text |
-| `/status` | `cmd_status` | Reads panel, lists all managed slots |
-| `/fill N` | `cmd_fill` | Fills slots 1…N with healthy candidates |
-| `/replace 1,5` | `cmd_replace` | Replaces specific slots (health-checked) |
-| `/checkall` | `cmd_checkall` | Checks existing slots, replaces failed ones |
-| `/setup` | `cmd_setup` (ConversationHandler) | 3-step wizard: URL → username → password → confirm |
+| `/start` | `cmd_start` | Shows help |
+| `/help` | `cmd_help` | Shows help |
+| `/status` | `cmd_status` | Lists all managed slots |
+| `/fill N` | `cmd_fill` | Fills slots 1…N |
+| `/replace 1,5` | `cmd_replace` | Replaces specific slots |
+| `/checkall` | `cmd_checkall` | Checks all slots, replaces failed |
+| `/setup` | `cmd_setup` (ConversationHandler) | URL → username → password → confirm |
 | `/cancel` | `setup_cancel` | Aborts setup wizard |
 
-- All handlers start with `if not _allowed(update): return await _reject(update)` — unauthorised users get no response.
-- `/setup` validates credentials by actually logging into the panel before saving.
-- `/setup` writes the new values to `config.py` on disk (regex replace) so they survive restart.
-- Command menu is registered with Telegram on startup via `bot.set_my_commands()` (no BotFather needed).
+- Unauthorised users are silently ignored (`_reject` logs a warning but sends no reply).
+- `/setup` tests credentials by actually logging into the panel before saving.
+- `/setup` writes new values to `config.py` on disk so they survive restart.
+- Command menu registered on startup via `bot.set_my_commands()` — no BotFather needed.
 
 ---
 
-## Planned features (not yet implemented)
+## Performance
 
-1. **Real IP dedup via Xray binary**
-   - Spin up a temporary Xray process with SOCKS5 inbound on a random port.
-   - Make an HTTP request through it to `https://api.ipify.org`.
-   - Use the returned IP for dedup instead of the address string.
-   - Xray binary path: `/usr/local/x-ui/bin/xray` (installed by 3x-ui).
-   - Decision pending: run after TCP health check (more accurate, slower) or replace it.
+Xray mode: ~3–10s per candidate.
+- `/fill 5` ≈ 30–60s
+- `/fill 10` ≈ 1–2 min
+- `/checkall` (10 slots) ≈ 2–3 min (checks all slots + fetches replacements for failed ones)
 
-2. **Auto-schedule** — optional cron/systemd timer to run `/checkall` nightly.
-
-3. **Slot gap detection** — make `/checkall` detect and recreate manually deleted slots.
+The Telegram bot stays responsive during these operations because they run inside the async handler (blocking the single handler thread but not the polling loop).
 
 ---
 
 ## Known issues / gotchas
 
-- **Panel URL** must NOT include `/panel` or `/panel/xray`. The installer now validates this, and `/setup` also warns if `/panel` is in the URL.
-- **VLESS settings** use a flat format in 3x-ui (not `vnext`). This differs from the Xray core spec and was the cause of `undefined:undefined` showing in the panel UI before the fix.
-- **`outboundTestUrl`** must be sent with every save request. `panel_client.py` caches it automatically from the last read.
-- **Large `CANDIDATES_TO_FETCH`** values slow down `/fill` and `/checkall` significantly since each candidate is TCP-checked.
+- **Panel URL** must NOT include `/panel`. Installer and `/setup` both validate and warn.
+- **VLESS flat format** — 3x-ui uses flat settings, not Xray core `vnext`. Using `vnext` breaks the panel UI.
+- **`outboundTestUrl`** must accompany every save. `panel_client.py` handles this automatically.
+- **`allowInsecure` removed in Xray 26.x** — never include in `tlsSettings`.
+- **`CANDIDATES_TO_FETCH`** may need to be raised if many candidates fail the Xray check. With 80 candidates and 10 slots needed, there's usually enough margin.
+- **Xray binary path** may differ on non-standard 3x-ui installs. Check with: `find / -name 'xray-linux-amd64' 2>/dev/null`
+
+---
+
+## Planned features
+
+1. **Auto-schedule** — optional systemd timer to run `/checkall` nightly.
+2. **Slot gap detection** — make `/checkall` detect and recreate manually deleted slots.
+3. **Parallel candidate checking** — run multiple Xray processes in parallel to speed up `/fill` and `/checkall`.
 
 ---
 
@@ -225,7 +250,7 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 cp config.example.py config.py
-# fill in config.py
+# fill in config.py, set XRAY_CHECK_ENABLED = False for local dev without xray
 python bot.py
 ```
 
@@ -233,10 +258,9 @@ python bot.py
 
 ## Key files to read first
 
-If you're picking this up for the first time, read in this order:
-
-1. `config.example.py` — understand all settings
-2. `panel_client.py` — how the panel API works
-3. `converter.py` — outbound dict structure per protocol
-4. `merger.py` — how outbounds are inserted into the config
-5. `bot.py` — command flow from top to bottom
+1. `config.example.py` — all available settings
+2. `panel_client.py` — panel API details
+3. `converter.py` — outbound dict structure per protocol + Xray 26.x notes
+4. `ipcheck.py` — Xray subprocess flow
+5. `merger.py` — how outbounds are inserted
+6. `bot.py` — command handlers top to bottom
