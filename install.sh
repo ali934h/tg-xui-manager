@@ -8,15 +8,64 @@ INSTALL_DIR="/root/tg-xui-manager"
 SERVICE_NAME="tg-xui-manager"
 PYTHON="python3"
 
+# Preferred Xray version (tested and confirmed working with this project).
+# If this release is unavailable, the installer falls back to latest.
+XRAY_PREFERRED_VERSION="v26.4.25"
+XRAY_INSTALL_DIR="/root/tg-xui-manager-xray"
+XRAY_BINARY="$XRAY_INSTALL_DIR/xray"
+
 echo "=== tg-xui-manager installer ==="
 
-# ---------- dependencies ----------
-echo "[1/5] Installing system dependencies…"
+# ---------- system dependencies ----------
+echo "[1/6] Installing system dependencies…"
 apt-get update -qq
-apt-get install -y -qq python3 python3-venv python3-pip git curl
+apt-get install -y -qq python3 python3-venv python3-pip git curl unzip
+
+# ---------- Xray binary ----------
+echo "[2/6] Setting up Xray binary…"
+
+# Check if 3x-ui's own xray is available (same server installation)
+XUI_XRAY="/usr/local/x-ui/bin/xray-linux-amd64"
+if [ -x "$XUI_XRAY" ]; then
+    echo "  Found 3x-ui Xray at $XUI_XRAY — using it directly."
+    XRAY_BINARY="$XUI_XRAY"
+else
+    echo "  3x-ui Xray not found — downloading standalone Xray binary…"
+    mkdir -p "$XRAY_INSTALL_DIR"
+
+    ARCH="$(uname -m)"
+    case "$ARCH" in
+        x86_64)  XRAY_ARCH="64" ;;
+        aarch64) XRAY_ARCH="arm64-v8a" ;;
+        armv7l)  XRAY_ARCH="arm32-v7a" ;;
+        *)       XRAY_ARCH="64" ;;
+    esac
+
+    # Try preferred version first, fall back to latest
+    PREFERRED_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_PREFERRED_VERSION}/Xray-linux-${XRAY_ARCH}.zip"
+    LATEST_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XRAY_ARCH}.zip"
+
+    echo "  Trying preferred version ${XRAY_PREFERRED_VERSION}…"
+    if curl -fsSL --head "$PREFERRED_URL" -o /dev/null 2>/dev/null; then
+        DOWNLOAD_URL="$PREFERRED_URL"
+        echo "  ✅ Preferred version available."
+    else
+        echo "  ⚠️  Preferred version not available — falling back to latest."
+        DOWNLOAD_URL="$LATEST_URL"
+    fi
+
+    TMP_ZIP="$(mktemp /tmp/xray-XXXXXX.zip)"
+    curl -fsSL "$DOWNLOAD_URL" -o "$TMP_ZIP"
+    unzip -o -q "$TMP_ZIP" -d "$XRAY_INSTALL_DIR"
+    rm -f "$TMP_ZIP"
+    chmod +x "$XRAY_BINARY"
+
+    XRAY_VER="$("$XRAY_BINARY" version 2>/dev/null | head -1 || echo 'unknown')"
+    echo "  Xray installed: $XRAY_VER"
+fi
 
 # ---------- clone / update ----------
-echo "[2/5] Cloning repository…"
+echo "[3/6] Cloning repository…"
 if [ -d "$INSTALL_DIR/.git" ]; then
     echo "  Directory exists — pulling latest…"
     git -C "$INSTALL_DIR" pull --ff-only
@@ -25,13 +74,13 @@ else
 fi
 
 # ---------- venv ----------
-echo "[3/5] Setting up Python virtual environment…"
+echo "[4/6] Setting up Python virtual environment…"
 $PYTHON -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
 "$INSTALL_DIR/venv/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"
 
 # ---------- config ----------
-echo "[4/5] Configuration…"
+echo "[5/6] Configuration…"
 CONFIG_FILE="$INSTALL_DIR/config.py"
 
 if [ ! -f "$CONFIG_FILE" ]; then
@@ -44,6 +93,7 @@ echo "  Panel base URL — the URL up to (but NOT including) /panel"
 echo "  Example: https://example.com:2053/mywebbasepath"
 echo "  If your panel login page is https://example.com:2053/mywebbasepath/panel/xray"
 echo "  then enter only:           https://example.com:2053/mywebbasepath"
+echo "  Note: the panel can be on a different server — just use its full URL."
 echo ""
 
 while true; do
@@ -69,9 +119,25 @@ sed -i "s|PANEL_USERNAME = .*|PANEL_USERNAME = \"$PANEL_USER\"|" "$CONFIG_FILE"
 sed -i "s|PANEL_PASSWORD = .*|PANEL_PASSWORD = \"$PANEL_PASS\"|" "$CONFIG_FILE"
 sed -i "s|BOT_TOKEN = .*|BOT_TOKEN = \"$BOT_TOKEN\"|" "$CONFIG_FILE"
 sed -i "s|ALLOWED_USERS = .*|ALLOWED_USERS = $ALLOWED_LIST|" "$CONFIG_FILE"
+sed -i "s|XRAY_BINARY = .*|XRAY_BINARY = \"$XRAY_BINARY\"|" "$CONFIG_FILE"
+
+# Append Xray worker settings if not present
+grep -q "XRAY_WORKERS" "$CONFIG_FILE" || cat >> "$CONFIG_FILE" << 'EOFCFG'
+
+# ---------- Parallel Workers ----------
+XRAY_WORKERS = 5
+EOFCFG
+
+grep -q "XRAY_CHECK_ENABLED" "$CONFIG_FILE" || cat >> "$CONFIG_FILE" << 'EOFCFG'
+
+# ---------- Xray Real Connectivity Check ----------
+XRAY_CHECK_ENABLED = True
+XRAY_STARTUP_WAIT_SEC = 2.0
+XRAY_REQUEST_TIMEOUT_SEC = 8
+EOFCFG
 
 # ---------- systemd service ----------
-echo "[5/5] Installing systemd service…"
+echo "[6/6] Installing systemd service…"
 
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
@@ -97,6 +163,10 @@ systemctl restart "$SERVICE_NAME"
 
 echo ""
 echo "=== Installation complete ==="
+echo ""
+echo "  Xray binary : $XRAY_BINARY"
+echo "  Install dir : $INSTALL_DIR"
+echo "  Panel URL   : $PANEL_URL"
 echo ""
 echo "Useful commands:"
 echo "  journalctl -u $SERVICE_NAME -f       # live logs"
