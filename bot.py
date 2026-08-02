@@ -153,9 +153,9 @@ def _address_of(outbound: dict) -> str | None:
 
 def _check_one(ob: dict, existing_keys: set[str]) -> tuple[dict, str] | None:
     """
-    Worker function: run ipcheck on a single outbound.
+    Worker: run ipcheck on a single outbound.
     Returns (outbound, exit_ip) if healthy and not in existing_keys, else None.
-    existing_keys is read-only here — used_this_run dedup is done in the caller.
+    existing_keys is read-only — used_this_run dedup is done in the caller.
     """
     exit_ip = ipcheck.check_outbound(ob)
     if exit_ip is None:
@@ -172,20 +172,14 @@ def _collect_candidates_parallel(
     existing_keys: set[str],
 ) -> list[tuple[dict, str]]:
     """
-    Parse and test candidates in parallel using ThreadPoolExecutor.
-    Returns a list of (outbound, exit_ip) tuples, deduplicated by exit IP,
-    up to `needed` results.
-
-    Workers: XRAY_WORKERS from config (default 5).
-    Batch strategy: submit XRAY_WORKERS * 2 candidates at a time, collect
-    results as they arrive, stop when we have enough.
+    Parse and test candidates in parallel.
+    Returns up to `needed` (outbound, exit_ip) tuples, deduplicated by exit IP.
     """
     workers = getattr(config, "XRAY_WORKERS", 5)
     results: list[tuple[dict, str]] = []
-    seen_ips: set[str] = set()  # dedup within this run
+    seen_ips: set[str] = set()
     lock = threading.Lock()
 
-    # Parse all candidate links first (fast, no I/O)
     parsed: list[dict] = []
     for link in candidates:
         ob = converter.parse_link(link)
@@ -195,7 +189,6 @@ def _collect_candidates_parallel(
     if not parsed:
         return []
 
-    # Submit in batches to avoid spawning all at once
     batch_size = workers * 3
     idx = 0
 
@@ -208,7 +201,6 @@ def _collect_candidates_parallel(
 
             for future in as_completed(futures):
                 if len(results) >= needed:
-                    # Cancel remaining futures (best effort)
                     for f in futures:
                         f.cancel()
                     break
@@ -413,13 +405,14 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("No managed slots found on panel.")
         return
 
-    # Check existing slots (also parallel in xray mode)
     failed_tags: list[str] = []
-    seen_ips: set[str] = set()
+    # IPs of healthy slots (used to avoid picking same IP as replacement)
+    healthy_ips: set[str] = set()
+    # IPs of failed slots (also excluded from replacements to avoid re-picking same server)
+    failed_ips: set[str] = set()
 
     if use_xray:
-        # Build synthetic outbounds for existing slots and check them in parallel
-        slot_obs: list[tuple[str, dict]] = []  # (tag, outbound_with_meta)
+        slot_obs: list[tuple[str, dict]] = []
         for ob in managed:
             tag = ob.get("tag", "")
             proto = ob.get("protocol", "")
@@ -448,7 +441,17 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 if exit_ip is None:
                     failed_tags.append(tag)
                 else:
-                    seen_ips.add(exit_ip)
+                    healthy_ips.add(exit_ip)
+
+        # Get exit IPs of failed slots so replacements don't pick the same servers
+        failed_slot_obs = [ob for tag, ob in slot_obs if tag in failed_tags]
+        if failed_slot_obs:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(ipcheck.check_outbound, ob) for ob in failed_slot_obs]
+                for future in as_completed(futures):
+                    ip = future.result()
+                    if ip:
+                        failed_ips.add(ip)
     else:
         for ob in managed:
             tag = ob.get("tag", "")
@@ -477,7 +480,8 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"\u26a0\ufe0f {len(failed_tags)} slot(s) failed: {failed_tags}\nFetching replacements\u2026"
     )
 
-    existing_keys = _current_ips(xray_cfg) | seen_ips
+    # existing_keys = healthy slot IPs + failed slot IPs (avoid re-picking same servers)
+    existing_keys = healthy_ips | failed_ips
     candidates = scraper.collect_candidate_configs(limit=config.CANDIDATES_TO_FETCH)
     if not candidates:
         await update.message.reply_text("\u274c Could not fetch candidates from source.")
