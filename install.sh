@@ -39,7 +39,22 @@ if [ ! -f "$CONFIG_FILE" ]; then
     chmod 600 "$CONFIG_FILE"
 fi
 
-read -rp "  Panel base URL (e.g. https://host:port/path): " PANEL_URL
+echo ""
+echo "  Panel base URL — the URL up to (but NOT including) /panel"
+echo "  Example: https://example.com:2053/mywebbasepath"
+echo "  If your panel login page is https://example.com:2053/mywebbasepath/panel/xray"
+echo "  then enter only:           https://example.com:2053/mywebbasepath"
+echo ""
+
+while true; do
+    read -rp "  Panel base URL: " PANEL_URL
+    if echo "$PANEL_URL" | grep -q "/panel"; then
+        echo "  ⚠️  URL should not include /panel — please re-enter."
+    else
+        break
+    fi
+done
+
 read -rp "  Panel username: " PANEL_USER
 read -rsp "  Panel password: " PANEL_PASS
 echo ""

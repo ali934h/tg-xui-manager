@@ -3,6 +3,7 @@ tg-xui-manager  —  Telegram bot to manage 3x-ui panel outbounds.
 
 Commands
 --------
+/start /help   Show available commands.
 /fill N        Fill slots out01..out0N with healthy, non-duplicate candidates.
 /replace 1,5   Replace specific slots directly (no health check).
 /checkall      Health-check all managed slots; replace only the failed ones.
@@ -41,6 +42,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+HELP_TEXT = """\
+🤖 *tg-xui-manager* — 3x-ui outbound manager
+
+*Commands:*
+/status — List all managed slots (address / port / protocol)
+/checkall — Health-check all slots; replace failed ones automatically
+/fill N — Fill slots out01…out0N with healthy candidates
+  _Example:_ /fill 10
+/replace 1,5,8 — Force-replace specific slot numbers
+  _Example:_ /replace 3,7
+/setup — Change panel URL, username, or password
+/help — Show this message
+"""
+
 # ---------------------------------------------------------------------------
 # Auth guard
 # ---------------------------------------------------------------------------
@@ -54,6 +69,22 @@ async def _reject(update: Update) -> None:
     logger.warning(
         "Unauthorised access attempt from user_id=%s", update.effective_user.id
     )
+
+
+# ---------------------------------------------------------------------------
+# /start  /help
+# ---------------------------------------------------------------------------
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed(update):
+        return await _reject(update)
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed(update):
+        return await _reject(update)
+    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +129,8 @@ def _fetch_next_candidate(
     existing_addresses: set[str],
     already_used_in_this_run: set[str],
     candidates: list[str],
-    candidate_cursor: list[int],   # mutable int wrapper
+    candidate_cursor: list[int],
 ) -> dict | None:
-    """
-    Walk the candidate list from cursor, parse + health-check each one,
-    skip duplicates (address string match), return the first good one or None.
-    """
     while candidate_cursor[0] < len(candidates):
         link = candidates[candidate_cursor[0]]
         candidate_cursor[0] += 1
@@ -284,7 +311,6 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     failed_tags: list[str] = []
     for ob in managed:
         tag = ob.get("tag", "")
-        # Build a minimal _meta for health check from existing outbound
         proto = ob.get("protocol", "")
         try:
             if proto in ("vless", "vmess"):
@@ -396,7 +422,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ---------------------------------------------------------------------------
 
 SETUP_URL, SETUP_USER, SETUP_PASS, SETUP_CONFIRM = range(4)
-_setup_data: dict[int, dict] = {}   # keyed by user_id
+_setup_data: dict[int, dict] = {}
 
 
 async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -405,24 +431,34 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     await update.message.reply_text(
-        "⚙️ Panel setup wizard\n\n"
-        "Step 1/3 — Enter the panel base URL (up to but NOT including /panel/xray).\n"
-        "Example: https://example.com:2053/mywebpath\n\n"
-        "Send /cancel to abort."
+        "⚙️ *Panel setup wizard*\n\n"
+        "*Step 1/3* — Enter the panel base URL.\n\n"
+        "✅ Correct format:\n"
+        "`https://example.com:2053/mywebpath`\n\n"
+        "❌ Do NOT include /panel or /panel/xray at the end.\n\n"
+        "Send /cancel to abort.",
+        parse_mode="Markdown",
     )
     return SETUP_URL
 
 
 async def setup_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     url = update.message.text.strip().rstrip("/")
+    # Warn if user included /panel in the URL
+    if "/panel" in url:
+        await update.message.reply_text(
+            "⚠️ The URL should not include /panel or /panel/xray.\n"
+            "Please re-enter the URL stopping before /panel:"
+        )
+        return SETUP_URL
     _setup_data[update.effective_user.id] = {"url": url}
-    await update.message.reply_text("Step 2/3 — Enter the panel username:")
+    await update.message.reply_text("*Step 2/3* — Enter the panel username:", parse_mode="Markdown")
     return SETUP_USER
 
 
 async def setup_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _setup_data[update.effective_user.id]["username"] = update.message.text.strip()
-    await update.message.reply_text("Step 3/3 — Enter the panel password:")
+    await update.message.reply_text("*Step 3/3* — Enter the panel password:", parse_mode="Markdown")
     return SETUP_PASS
 
 
@@ -430,11 +466,12 @@ async def setup_pass(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _setup_data[update.effective_user.id]["password"] = update.message.text.strip()
     data = _setup_data[update.effective_user.id]
     await update.message.reply_text(
-        f"🔍 Confirm new settings?\n\n"
-        f"  URL:      {data['url']}\n"
-        f"  Username: {data['username']}\n"
-        f"  Password: {'*' * len(data['password'])}\n\n"
-        "Reply yes to save, anything else to cancel."
+        f"🔍 *Confirm new settings?*\n\n"
+        f"  URL:      `{data['url']}`\n"
+        f"  Username: `{data['username']}`\n"
+        f"  Password: `{'*' * len(data['password'])}`\n\n"
+        "Reply *yes* to save, anything else to cancel.",
+        parse_mode="Markdown",
     )
     return SETUP_CONFIRM
 
@@ -448,7 +485,7 @@ async def setup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     data = _setup_data.pop(uid, {})
 
-    # Test the credentials before writing
+    await update.message.reply_text("⏳ Testing credentials…")
     try:
         test_client = panel_client.PanelClient(
             base_url=data["url"],
@@ -462,13 +499,10 @@ async def setup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return ConversationHandler.END
 
-    # Persist to config.py at runtime (in-memory only — survives until restart)
-    # For persistence across restarts, write to config.py on disk.
     config.PANEL_BASE_URL = data["url"]
     config.PANEL_USERNAME = data["username"]
     config.PANEL_PASSWORD = data["password"]
 
-    # Also write to config.py so they survive a service restart
     try:
         _write_config(data["url"], data["username"], data["password"])
         await update.message.reply_text("✅ Panel credentials saved and verified.")
@@ -481,7 +515,6 @@ async def setup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 def _write_config(url: str, username: str, password: str) -> None:
-    """Overwrite PANEL_BASE_URL / PANEL_USERNAME / PANEL_PASSWORD in config.py."""
     import os
     path = os.path.join(os.path.dirname(__file__), "config.py")
     with open(path, "r", encoding="utf-8") as f:
@@ -528,6 +561,8 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", setup_cancel)],
     )
 
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("fill", cmd_fill))
     app.add_handler(CommandHandler("replace", cmd_replace))
     app.add_handler(CommandHandler("checkall", cmd_checkall))
