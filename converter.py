@@ -1,15 +1,17 @@
 """
 Parse subscription links (vless://, vmess://, trojan://, ss://) into
-outbound dicts compatible with the 3x-ui panel (v2.9.3).
+outbound dicts compatible with the 3x-ui panel (v2.9.3) and Xray 26.x.
+
+IMPORTANT: Xray 26.x removed 'allowInsecure' from tlsSettings.
+Do NOT include it in any generated config — xray will refuse to start.
 
 Verified against web/assets/js/model/outbound.js from 3x-ui source:
-
-  VLESS  settings: {address, port, id, flow, encryption}          ← flat (panel format)
+  VLESS  settings: {address, port, id, flow, encryption}  <- flat (panel format)
   VMess  settings: {vnext: [{address, port, users: [{id, security}]}]}
   Trojan settings: {servers: [{address, port, password}]}
   SS     settings: {servers: [{address, port, method, password}]}
 
-Each parser also attaches a "_meta" key for internal health-check use.
+Each parser attaches '_meta' for internal use (health check / ip check).
 merger.py strips _meta before sending the config to the panel.
 """
 
@@ -36,6 +38,10 @@ def _p(params: dict, key: str, default: str = "") -> str:
 def _build_stream_settings(
     net: str, security: str, params: dict, sni_fallback: str = ""
 ) -> dict:
+    """
+    Build streamSettings dict for Xray 26.x.
+    Note: 'allowInsecure' was removed in Xray 26.x — never include it.
+    """
     stream: dict = {"network": net or "tcp"}
 
     if net == "ws":
@@ -53,13 +59,11 @@ def _build_stream_settings(
 
     if security == "tls":
         stream["security"] = "tls"
-        sni = _p(params, "sni", sni_fallback)
-        allow_insecure = _p(params, "allowInsecure", "0")
         stream["tlsSettings"] = {
-            "serverName": sni,
+            "serverName": _p(params, "sni", sni_fallback),
             "alpn": [],
             "fingerprint": _p(params, "fp", "chrome"),
-            "allowInsecure": allow_insecure in ("1", "true", "True"),
+            # allowInsecure intentionally omitted (removed in Xray 26.x)
         }
     elif security == "reality":
         stream["security"] = "reality"
@@ -78,7 +82,7 @@ def _build_stream_settings(
 
 def parse_vless(link: str) -> dict | None:
     """
-    VLESS outbound settings use a flat structure in 3x-ui (not vnext).
+    VLESS outbound — flat settings format (3x-ui panel, not Xray core vnext).
     Source: Outbound.VLESSSettings.toJson() in outbound.js
     """
     try:
@@ -86,8 +90,7 @@ def parse_vless(link: str) -> dict | None:
         params = parse_qs(parsed.query)
         address = parsed.hostname
         port = parsed.port
-
-        outbound = {
+        return {
             "protocol": "vless",
             "settings": {
                 "address": address,
@@ -104,33 +107,22 @@ def parse_vless(link: str) -> dict | None:
             ),
             "_meta": {"address": address, "port": port},
         }
-        return outbound
     except Exception as e:
         logger.warning("vless parse failed: %s | %s", e, link[:80])
         return None
 
 
 def parse_trojan(link: str) -> dict | None:
-    """
-    Trojan settings: servers array.
-    Source: Outbound.TrojanSettings.toJson() in outbound.js
-    """
+    """Trojan outbound — servers array format."""
     try:
         parsed = urlparse(link)
         params = parse_qs(parsed.query)
         address = parsed.hostname
         port = parsed.port
-
-        outbound = {
+        return {
             "protocol": "trojan",
             "settings": {
-                "servers": [
-                    {
-                        "address": address,
-                        "port": port,
-                        "password": parsed.username,
-                    }
-                ]
+                "servers": [{"address": address, "port": port, "password": parsed.username}]
             },
             "streamSettings": _build_stream_settings(
                 _p(params, "type", "tcp"),
@@ -140,17 +132,13 @@ def parse_trojan(link: str) -> dict | None:
             ),
             "_meta": {"address": address, "port": port},
         }
-        return outbound
     except Exception as e:
         logger.warning("trojan parse failed: %s | %s", e, link[:80])
         return None
 
 
 def parse_vmess(link: str) -> dict | None:
-    """
-    VMess settings: vnext array (same as Xray core format).
-    Source: Outbound.VmessSettings.toJson() in outbound.js
-    """
+    """VMess outbound — vnext array format."""
     try:
         data = json.loads(_b64_decode(link[len("vmess://"):]))
         address = data.get("add")
@@ -164,23 +152,18 @@ def parse_vmess(link: str) -> dict | None:
             "fp": [data.get("fp", "chrome")],
             "headerType": [data.get("type", "none")],
         }
-
-        outbound = {
+        return {
             "protocol": "vmess",
             "settings": {
-                "vnext": [
-                    {
-                        "address": address,
-                        "port": port,
-                        "users": [
-                            {
-                                "id": data.get("id"),
-                                "alterId": int(data.get("aid", 0)),
-                                "security": data.get("scy", "auto"),
-                            }
-                        ],
-                    }
-                ]
+                "vnext": [{
+                    "address": address,
+                    "port": port,
+                    "users": [{
+                        "id": data.get("id"),
+                        "alterId": int(data.get("aid", 0)),
+                        "security": data.get("scy", "auto"),
+                    }],
+                }]
             },
             "streamSettings": _build_stream_settings(
                 data.get("net", "tcp"),
@@ -190,17 +173,13 @@ def parse_vmess(link: str) -> dict | None:
             ),
             "_meta": {"address": address, "port": port},
         }
-        return outbound
     except Exception as e:
         logger.warning("vmess parse failed: %s | %s", e, link[:80])
         return None
 
 
 def parse_shadowsocks(link: str) -> dict | None:
-    """
-    Shadowsocks settings: servers array.
-    Source: Outbound.ShadowsocksSettings.toJson() in outbound.js
-    """
+    """Shadowsocks outbound — servers array format."""
     try:
         body = link[len("ss://"):].split("#", 1)[0]
         if "@" in body:
@@ -217,23 +196,19 @@ def parse_shadowsocks(link: str) -> dict | None:
             method_password, hostport = decoded.rsplit("@", 1)
             method, password = method_password.split(":", 1)
             host, port = hostport.split(":", 1)
-
-        outbound = {
+        return {
             "protocol": "shadowsocks",
             "settings": {
-                "servers": [
-                    {
-                        "address": host,
-                        "port": int(port),
-                        "method": method,
-                        "password": password,
-                    }
-                ]
+                "servers": [{
+                    "address": host,
+                    "port": int(port),
+                    "method": method,
+                    "password": password,
+                }]
             },
             "streamSettings": {"network": "tcp", "security": "none"},
             "_meta": {"address": host, "port": int(port)},
         }
-        return outbound
     except Exception as e:
         logger.warning("shadowsocks parse failed: %s | %s", e, link[:80])
         return None
