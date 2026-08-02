@@ -1,12 +1,12 @@
 # AI Handoff Document — tg-xui-manager
 
-This document is written for an AI assistant (or developer) taking over this project. It covers everything needed to understand the codebase, make changes safely, and continue development.
+This document is written for an AI assistant (or developer) taking over this project.
 
 ---
 
 ## Project summary
 
-`tg-xui-manager` is a **Telegram bot** that manages the outbound section of a [3x-ui](https://github.com/MHSanaei/3x-ui) Xray panel. It fetches free V2Ray/Trojan/SS configs from a public GitHub source, verifies each one in parallel by making a real HTTP request through the local Xray binary, and pushes verified, deduplicated configs into the panel — all triggered by Telegram commands.
+`tg-xui-manager` is a **Telegram bot** that manages the outbound section of a [3x-ui](https://github.com/MHSanaei/3x-ui) Xray panel. It fetches free V2Ray/Trojan/SS configs from a public GitHub source, verifies each one in parallel by making a real HTTP request through a local Xray binary, and pushes verified, deduplicated configs into the panel — all triggered by Telegram commands.
 
 **Stack:** Python 3.10+, `python-telegram-bot` v20+, `requests`, `PySocks`, `curl`, `systemd` on Ubuntu.
 **Tested on:** 3x-ui v2.9.3, Xray 26.4.25, Ubuntu 22.04/24.04.
@@ -16,7 +16,7 @@ This document is written for an AI assistant (or developer) taking over this pro
 ## Repository layout
 
 ```
-bot.py              Entry point. All Telegram command handlers.
+bot.py              Entry point. All Telegram handlers + SlotKeys dedup class.
 panel_client.py     HTTP client for the 3x-ui panel API.
 converter.py        Parses vless/vmess/trojan/ss links into outbound dicts.
 ipcheck.py          Real connectivity check via Xray binary; returns exit IP.
@@ -25,7 +25,7 @@ scraper.py          Downloads candidate config list from GitHub raw.
 merger.py           Merges outbound dicts into the full Xray config.
 config.example.py   Template for config.py (never committed).
 config.py           Runtime secrets (gitignored, chmod 600).
-install.sh          One-line installer (systemd service).
+install.sh          One-line installer: downloads Xray + systemd setup.
 update.sh           git pull + pip install + systemctl restart.
 uninstall.sh        Stops and removes the service and all files.
 docs/               This folder.
@@ -57,143 +57,136 @@ No database, no scheduler. Everything is triggered by a Telegram command.
 
 ### Xray mode (default, `XRAY_CHECK_ENABLED=True`)
 
-1. **Parse all candidates** (`converter.py`) — extract protocol, address, port, settings.
-2. **Parallel check** (`_collect_candidates_parallel` in `bot.py`):
-   - Use `ThreadPoolExecutor(max_workers=XRAY_WORKERS)` (default 5).
-   - Submit candidates in batches of `XRAY_WORKERS * 3`.
-   - Each worker calls `ipcheck.check_outbound(ob)`:
-     - Find a free local TCP port.
-     - Write a temp Xray config: SOCKS5 inbound → candidate outbound.
-     - Spawn `xray-linux-amd64 -c /tmp/tmpXXX.json`.
-     - Wait `XRAY_STARTUP_WAIT_SEC` (default 2s).
-     - Run `curl --proxy socks5h://127.0.0.1:{port} https://api.ipify.org`.
-     - If curl returns a valid IPv4 → return that IP as exit IP.
-     - Terminate xray and delete temp file.
-   - Collect results as futures complete (`as_completed`).
-   - **Dedup**: skip if exit IP already in `existing_keys` (current slots) or `seen_ips` (this run).
-   - Stop when `needed` good candidates are found.
-3. **Apply** — push accepted outbounds to panel via `panel_client`.
+**Step 1 — Pre-filter** (no I/O, instant):
+
+For each candidate, build a `SlotKeys` object from existing panel slots containing:
+- `addresses` — set of all addresses (IP/domain) in use
+- `credentials` — set of all UUIDs and passwords in use
+- `exit_ips` — set of real exit IPs (populated during `/checkall`)
+
+A candidate is **rejected if ANY of these match**:
+- Its address is in `slot_keys.addresses` or was accepted earlier this run
+- Its credential (UUID/password) is in `slot_keys.credentials` or was accepted earlier this run
+
+This is the key improvement over earlier versions that only checked `address:port:credential` as a combined fingerprint — now each field is checked independently.
+
+**Step 2 — Parallel Xray check** (`_collect_candidates_parallel`):
+- Use `ThreadPoolExecutor(max_workers=XRAY_WORKERS)` (default 5).
+- Submit candidates in batches of `XRAY_WORKERS * 3`.
+- Each worker calls `ipcheck.check_outbound(ob)`:
+  - Find a free local TCP port.
+  - Write a temp Xray config: SOCKS5 inbound → candidate outbound.
+  - Spawn `xray-linux-amd64 -c /tmp/tmpXXX.json`.
+  - Wait `XRAY_STARTUP_WAIT_SEC` (default 2s).
+  - Run `curl --proxy socks5h://127.0.0.1:{port} https://api.ipify.org`.
+  - If curl returns a valid IPv4 → candidate is alive, return that IP.
+  - Terminate xray and delete temp file.
+- Post-filter: reject if exit IP is in `slot_keys.exit_ips` or was seen this run.
+- Stop collecting when `needed` candidates are found.
+
+**Step 3 — Apply**: push accepted outbounds to panel.
 
 ### TCP fallback mode (`XRAY_CHECK_ENABLED=False`)
 
-- Serial loop: parse → TCP connect → dedup by address string.
-- Much faster but less accurate (can't detect dead protocols or same-origin CDN configs).
+Same pre-filter (address/credential dedup), then serial TCP connect check.
 
 ---
 
-## Parallelism details
+## SlotKeys class
 
-- `ThreadPoolExecutor` is used (not `asyncio`) because `ipcheck.check_outbound` is blocking (subprocess + curl).
-- The thread pool runs inside the async Telegram handler, blocking that handler's thread. The Telegram polling loop itself is not blocked (it runs in a separate asyncio task).
-- `seen_ips` is protected by a `threading.Lock()` to prevent race conditions when multiple workers finish simultaneously.
-- `existing_keys` is read-only in workers (built before the pool starts) — no lock needed.
-- Batch size = `XRAY_WORKERS * 3` to keep the pool fed without submitting all 80 candidates at once.
+Defined in `bot.py`. Central to all dedup logic.
+
+```python
+class SlotKeys:
+    addresses:   set[str]   # IPs and domains of existing slots
+    credentials: set[str]   # UUIDs and passwords of existing slots
+    exit_ips:    set[str]   # real exit IPs (populated by /checkall)
+
+    def is_duplicate(self, ob) -> (bool, reason)  # check one candidate
+    def add_from_ob(self, ob)                      # register a slot's keys
+```
+
+`_current_slot_keys(xray_cfg)` builds this from all managed slots on the panel.
 
 ---
 
 ## Panel API (3x-ui v2.9.3)
 
-All endpoints are relative to `PANEL_BASE_URL`.
-
 | Endpoint | Method | Content-Type | Notes |
 |---|---|---|---|
 | `/login` | POST | form | Fields: `username`, `password` |
-| `/panel/xray` | POST | — | Returns `{success, obj: "<json string>"}`. `obj` contains `{xraySetting, outboundTestUrl}` |
+| `/panel/xray` | POST | — | Returns `{success, obj: "<json>"}`. `obj` has `{xraySetting, outboundTestUrl}` |
 | `/panel/xray/update` | POST | `application/x-www-form-urlencoded` | Fields: `xraySetting=<json>`, `outboundTestUrl=<url>` |
 
-**Critical:** Save endpoint must be `form-urlencoded`, NOT `application/json`. Verified with DevTools raw capture.
-
-**`outboundTestUrl`** must be included in every save. `panel_client.py` caches it from the read response.
+**Critical:** Save endpoint must be `form-urlencoded`, NOT `application/json`.
+**`outboundTestUrl`** must be included. `panel_client.py` caches it automatically.
 
 ---
 
 ## Outbound settings format (per protocol)
 
-Verified from `web/assets/js/model/outbound.js` in 3x-ui v2.9.3 source.
+Verified from 3x-ui v2.9.3 source (`web/assets/js/model/outbound.js`).
 
 ### VLESS — flat format (NOT vnext)
 ```json
-{
-  "protocol": "vless",
-  "settings": {"address": "1.2.3.4", "port": 443, "id": "uuid", "flow": "", "encryption": "none"},
-  "streamSettings": { ... },
-  "tag": "out01"
-}
+{"protocol": "vless", "settings": {"address": "1.2.3.4", "port": 443, "id": "uuid", "flow": "", "encryption": "none"}, "tag": "out01"}
 ```
-> ⚠️ Using Xray core `vnext` format causes `undefined:undefined` in the 3x-ui panel UI.
+> ⚠️ Xray core uses `vnext` but 3x-ui panel UI expects flat. `vnext` shows `undefined:undefined`.
 
 ### VMess — vnext format
 ```json
-{
-  "protocol": "vmess",
-  "settings": {"vnext": [{"address": "1.2.3.4", "port": 443,
-    "users": [{"id": "uuid", "alterId": 0, "security": "auto"}]}]},
-  "streamSettings": { ... },
-  "tag": "out02"
-}
+{"protocol": "vmess", "settings": {"vnext": [{"address": "1.2.3.4", "port": 443, "users": [{"id": "uuid", "alterId": 0, "security": "auto"}]}]}, "tag": "out02"}
 ```
 
 ### Trojan
 ```json
-{
-  "protocol": "trojan",
-  "settings": {"servers": [{"address": "1.2.3.4", "port": 443, "password": "..."}]},
-  "streamSettings": { ... }, "tag": "out03"
-}
+{"protocol": "trojan", "settings": {"servers": [{"address": "1.2.3.4", "port": 443, "password": "..."}]}, "tag": "out03"}
 ```
 
 ### Shadowsocks
 ```json
-{
-  "protocol": "shadowsocks",
-  "settings": {"servers": [{"address": "1.2.3.4", "port": 8388, "method": "aes-256-gcm", "password": "..."}]},
-  "streamSettings": {"network": "tcp", "security": "none"}, "tag": "out04"
-}
+{"protocol": "shadowsocks", "settings": {"servers": [{"address": "1.2.3.4", "port": 8388, "method": "aes-256-gcm", "password": "..."}]}, "tag": "out04"}
 ```
 
 ---
 
 ## Xray 26.x compatibility
 
-**`allowInsecure` was removed** from `tlsSettings` in Xray 26.x:
-```
-Failed to start: ... The feature "allowInsecure" has been removed
-```
+**`allowInsecure` removed** from `tlsSettings`. Including it causes xray to refuse to start.
 `converter.py` intentionally omits this field. Never add it back.
 
-Xray binary path: `/usr/local/x-ui/bin/xray-linux-amd64`
+Xray binary installed by installer: `/root/tg-xui-manager-xray/xray` (v26.4.25).
 
 ---
 
 ## Slot system
 
-- Tags matching `^out\d{2}$` (e.g. `out01`…`out99`) are "managed slots".
-- Prefix/digits configurable: `SLOT_TAG_PREFIX` / `SLOT_TAG_DIGITS`.
-- `merger.slot_tag(n)` generates the canonical tag.
-- `/fill N` — creates/replaces slots 1 through N.
-- `/replace 1,5,8` — replaces only specified slot numbers.
-- `/checkall` — reads existing slots, tests in parallel, replaces failed ones.
-- **Manually deleted slots are invisible to `/checkall`** — use `/fill` or `/replace` to recreate.
+- Tags matching `^out\d{2}$` are managed. Configurable via `SLOT_TAG_PREFIX` / `SLOT_TAG_DIGITS`.
+- `/fill N` — creates/replaces slots 1…N.
+- `/replace 1,5,8` — replaces specified slots.
+- `/checkall` — tests all existing slots in parallel, replaces failed ones.
+- **Manually deleted slots are invisible to `/checkall`** — use `/fill` or `/replace`.
 
 ---
 
-## Duplicate detection
+## Duplicate detection (complete)
 
-**Xray mode:** dedup by **real exit IP**.
-- CDN-fronted configs: exit IP = origin server IP (traffic exits from the 3x-ui server).
-- Both existing slots and candidates found earlier in this run are tracked.
-- Lock protects `seen_ips` set during parallel collection.
+A candidate is rejected if **any** of these match an existing slot OR a candidate already accepted this run:
 
-**TCP fallback:** dedup by **address string** — less accurate.
+| Check | What it catches |
+|---|---|
+| Address match | Same IP or domain (e.g. `165.140.216.142`) |
+| Credential match | Same UUID or password (different address, same server account) |
+| Exit IP match | Same real origin server (catches CDN-fronted configs with different domains) |
+
+All three checks run before the Xray test (address + credential) and after (exit IP).
 
 ---
 
 ## Config source
 
 - URL: `https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY.txt`
-- Updated hourly. One link per line, prefixed with flag emoji.
-- Regex: `((?:vless|vmess|trojan|ss)://\S+)`
-- `CANDIDATES_TO_FETCH` (default 80) = max lines read.
+- Updated hourly. `CANDIDATES_TO_FETCH` (default 80) = max lines read.
 
 ---
 
@@ -205,38 +198,29 @@ Xray binary path: `/usr/local/x-ui/bin/xray-linux-amd64`
 | `/fill 10` | ~15–25s | <5s |
 | `/checkall` 10 slots | ~10–20s | <5s |
 
-Bottleneck: `XRAY_STARTUP_WAIT_SEC` (2s) per worker — lowering it to 1.5s may help on fast servers.
-
 ---
 
 ## Bot commands
 
 | Command | Handler | Behaviour |
 |---|---|---|
-| `/start` | `cmd_start` | Shows help |
-| `/help` | `cmd_help` | Shows help |
+| `/start` `/help` | `cmd_start/help` | Shows help |
 | `/status` | `cmd_status` | Lists all managed slots |
-| `/fill N` | `cmd_fill` | Fills slots 1…N (parallel) |
-| `/replace 1,5` | `cmd_replace` | Replaces specific slots (parallel) |
-| `/checkall` | `cmd_checkall` | Checks all slots in parallel, replaces failed |
+| `/fill N` | `cmd_fill` | Fills slots 1…N |
+| `/replace 1,5` | `cmd_replace` | Replaces specific slots |
+| `/checkall` | `cmd_checkall` | Checks all slots, replaces failed |
 | `/setup` | `cmd_setup` (ConversationHandler) | URL → username → password → confirm |
-| `/cancel` | `setup_cancel` | Aborts setup wizard |
-
-- Unauthorised users silently ignored.
-- `/setup` tests credentials before saving, writes to `config.py` on disk.
-- Command menu auto-registered via `bot.set_my_commands()` on startup.
 
 ---
 
 ## Known issues / gotchas
 
-- **Panel URL** must NOT include `/panel`. Both installer and `/setup` validate this.
-- **VLESS flat format** — use flat settings, not `vnext`. `vnext` breaks panel UI.
-- **`outboundTestUrl`** must accompany every save. Handled automatically.
-- **`allowInsecure` removed in Xray 26.x** — never include in `tlsSettings`.
-- **`CANDIDATES_TO_FETCH`** may need raising if many candidates fail. 80 is usually plenty for 10 slots.
-- **Xray binary path** may differ. Find it with: `find / -name 'xray-linux-amd64' 2>/dev/null`
-- **Parallel workers share port space**: each worker picks a random free port for its SOCKS5 inbound. Port collisions are extremely unlikely but theoretically possible on very busy servers.
+- **Panel URL** must NOT include `/panel`. Installer and `/setup` both validate.
+- **VLESS flat format** — never use `vnext` for VLESS outbounds.
+- **`outboundTestUrl`** required on every save. Handled automatically.
+- **`allowInsecure` removed in Xray 26.x** — never include.
+- **`CANDIDATES_TO_FETCH`** may need raising if source list has many failures. 80 is plenty for 10 slots normally.
+- **Xray binary path** set automatically by installer. If changed manually, update `XRAY_BINARY` in `config.py`.
 
 ---
 
@@ -244,7 +228,7 @@ Bottleneck: `XRAY_STARTUP_WAIT_SEC` (2s) per worker — lowering it to 1.5s may 
 
 1. **Auto-schedule** — systemd timer to run `/checkall` nightly.
 2. **Slot gap detection** — `/checkall` detects and recreates manually deleted slots.
-3. **Tunable `XRAY_STARTUP_WAIT_SEC`** — already in config, could be lowered to 1.0–1.5s for faster servers.
+3. **Lower `XRAY_STARTUP_WAIT_SEC`** — could be 1.0–1.5s on fast servers.
 
 ---
 
@@ -253,11 +237,10 @@ Bottleneck: `XRAY_STARTUP_WAIT_SEC` (2s) per worker — lowering it to 1.5s may 
 ```bash
 git clone https://github.com/ali934h/tg-xui-manager
 cd tg-xui-manager
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 cp config.example.py config.py
-# Set XRAY_CHECK_ENABLED = False for local dev (no xray binary needed)
+# Set XRAY_CHECK_ENABLED = False for local dev (no xray needed)
 python bot.py
 ```
 
@@ -265,9 +248,8 @@ python bot.py
 
 ## Key files to read first
 
-1. `config.example.py` — all available settings and their defaults
-2. `panel_client.py` — panel API details (critical: form-urlencoded, outboundTestUrl)
-3. `converter.py` — outbound dict structure per protocol + Xray 26.x notes
-4. `ipcheck.py` — Xray subprocess + curl flow
-5. `merger.py` — how outbounds are inserted/replaced
-6. `bot.py` — `_collect_candidates_parallel`, then command handlers
+1. `config.example.py` — all settings
+2. `panel_client.py` — API details
+3. `converter.py` — outbound format per protocol
+4. `bot.py` — `SlotKeys` class, then `_collect_candidates_parallel`, then handlers
+5. `ipcheck.py` — Xray subprocess flow

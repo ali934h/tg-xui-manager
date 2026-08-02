@@ -24,29 +24,31 @@ Unauthorised users are **silently ignored** — no reply that would reveal the b
 
 ## How candidate verification works
 
-Each candidate config goes through a **real connectivity test** before being accepted:
+Each candidate config is checked against existing slots and previous candidates in this run. A candidate is **rejected** if any of the following match an existing slot:
 
-1. Candidates are tested **in parallel** (`XRAY_WORKERS`, default 5).
-2. For each candidate, the local Xray binary starts with a temporary SOCKS5 inbound.
-3. An HTTP request is made through that SOCKS5 proxy to `https://api.ipify.org`.
-4. The returned IP is the **real exit IP** of the candidate server — even for Cloudflare-fronted configs, this reveals the true origin server IP.
-5. If the same exit IP was already seen (in existing slots or earlier in this run), the candidate is skipped.
+- **Address** (IP or domain)
+- **Credential** (UUID for vless/vmess, password for trojan/shadowsocks)
+- **Real exit IP** (obtained by connecting through the candidate via Xray)
 
-This means:
-- Only candidates that **actually work** are accepted
-- No two slots will share the same origin server IP
-- Checks run in parallel for speed
+Candidates that pass all checks are then tested for **real connectivity**:
 
-Fallback: set `XRAY_CHECK_ENABLED = False` in `config.py` to revert to a simple TCP latency check.
+1. The local Xray binary starts with a temporary SOCKS5 inbound.
+2. An HTTP request is made through it to `https://api.ipify.org`.
+3. The returned IP is the **real exit IP** of the candidate server.
+4. All checks run in **parallel** (`XRAY_WORKERS`, default 5).
+
+Fallback: set `XRAY_CHECK_ENABLED = False` for simple TCP latency check (faster, less accurate).
 
 ---
 
 ## Requirements
 
 - Ubuntu 22.04 / 24.04 VPS with root access
-- **3x-ui panel already installed on the same server** (provides the Xray binary)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - Your numeric Telegram user ID (ask [@userinfobot](https://t.me/userinfobot))
+- The panel can be on **any server** (same or different) — only the URL matters
+
+> The installer downloads its own Xray binary (v26.4.25) independently of any 3x-ui installation.
 
 ---
 
@@ -59,11 +61,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ali934h/tg-xui-manager/main/
 ```
 
 The installer will:
-1. Install `python3`, `python3-venv`, and `git`
-2. Clone this repo to `/root/tg-xui-manager`
-3. Create an isolated Python venv and install dependencies
-4. Prompt for panel URL, username, password, bot token, and allowed user IDs
-5. Install and start a `systemd` service that auto-starts on reboot
+1. Install `python3`, `python3-venv`, `git`, and `unzip`
+2. Download Xray v26.4.25 to `/root/tg-xui-manager-xray/xray`
+3. Clone this repo to `/root/tg-xui-manager`
+4. Create an isolated Python venv and install dependencies
+5. Prompt for panel URL, username, password, bot token, and allowed user IDs
+6. Install and start a `systemd` service that auto-starts on reboot
 
 ### Panel URL format
 
@@ -104,7 +107,7 @@ Use `/setup` in Telegram to change panel credentials at any time — the bot tes
 | `BOT_TOKEN` | — | Telegram bot token |
 | `ALLOWED_USERS` | — | List of numeric Telegram user IDs |
 | `XRAY_CHECK_ENABLED` | `True` | Use Xray binary for real connectivity check |
-| `XRAY_BINARY` | `/usr/local/x-ui/bin/xray-linux-amd64` | Path to Xray binary |
+| `XRAY_BINARY` | `/root/tg-xui-manager-xray/xray` | Path to Xray binary |
 | `XRAY_WORKERS` | `5` | Number of parallel candidate checks |
 | `XRAY_STARTUP_WAIT_SEC` | `2.0` | Seconds to wait for Xray to start |
 | `XRAY_REQUEST_TIMEOUT_SEC` | `8` | HTTP request timeout through SOCKS5 |
@@ -121,7 +124,7 @@ Use `/setup` in Telegram to change panel credentials at any time — the bot tes
 - The bot manages outbounds whose tags match `out01`…`out99` (configurable prefix/digits).
 - `/fill N` fills slots 1 through N — creates them if missing, replaces if present.
 - `/checkall` only checks slots that **currently exist** on the panel. Manually deleted slots are not detected — use `/fill N` or `/replace N` to recreate them.
-- Duplicate detection is based on **real exit IP** (Xray mode) or address string (fallback mode).
+- Duplicate detection checks **address, credential, and exit IP** independently — if any one matches an existing slot, the candidate is rejected.
 
 ---
 
@@ -137,8 +140,6 @@ With `XRAY_WORKERS = 5` (default):
 
 With `XRAY_CHECK_ENABLED = False` (TCP fallback): all operations complete in under 5 seconds.
 
-To increase speed further, raise `XRAY_WORKERS` (recommended max: 10 for servers with 2GB+ RAM).
-
 ---
 
 ## Config source
@@ -152,7 +153,7 @@ Supported protocols: `vless`, `vmess`, `trojan`, `shadowsocks`.
 
 ## Panel API compatibility
 
-Verified against **3x-ui v2.9.3** and **Xray 26.4.25**. The bot uses:
+Verified against **3x-ui v2.9.3** and **Xray 26.4.25**.
 
 | Endpoint | Method | Purpose |
 |---|---|---|
@@ -160,9 +161,9 @@ Verified against **3x-ui v2.9.3** and **Xray 26.4.25**. The bot uses:
 | `{base}/panel/xray` | POST | Read full Xray config |
 | `{base}/panel/xray/update` | POST (form-urlencoded) | Save Xray config |
 
-The VLESS outbound settings use the **flat format** expected by the 3x-ui panel (`address`, `port`, `id`, `flow`, `encryption`) — not the Xray core `vnext` format.
+VLESS outbound uses the **flat format** expected by 3x-ui (`address`, `port`, `id`, `flow`, `encryption`) — not Xray core `vnext`.
 
-> **Xray 26.x note:** `allowInsecure` was removed from `tlsSettings` in Xray 26.x. The bot never includes this field in generated configs.
+> **Xray 26.x note:** `allowInsecure` was removed from `tlsSettings`. The bot never includes this field.
 
 ---
 
@@ -177,7 +178,7 @@ The VLESS outbound settings use the **flat format** expected by the 3x-ui panel 
 ## Project structure
 
 ```
-bot.py              — Telegram bot (all command handlers)
+bot.py              — Telegram bot (all command handlers + SlotKeys dedup logic)
 panel_client.py     — 3x-ui panel API client (login, read, save)
 converter.py        — subscription link parser (vless/vmess/trojan/ss)
 ipcheck.py          — real connectivity check via Xray binary + exit IP
@@ -185,7 +186,7 @@ healthcheck.py      — TCP latency check (fallback when XRAY_CHECK_ENABLED=Fals
 scraper.py          — fetch candidate configs from GitHub raw source
 merger.py           — merge outbounds into Xray config dict
 config.example.py   — template (copy to config.py and fill in values)
-install.sh          — one-line installer (systemd)
+install.sh          — one-line installer (downloads Xray + systemd setup)
 update.sh           — git pull + pip install + restart
 uninstall.sh        — stop service, remove files
 docs/               — developer & AI handoff documentation
