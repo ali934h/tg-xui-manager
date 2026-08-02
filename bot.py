@@ -12,9 +12,10 @@ Commands
 
 Candidate evaluation pipeline:
   1. Parse all candidate links (converter.py)
-  2. If XRAY_CHECK_ENABLED: test XRAY_WORKERS candidates in parallel via Xray binary
-     (ipcheck.py), collect exit IPs, deduplicate.
-  3. If XRAY_CHECK_ENABLED is False: fall back to serial TCP latency check.
+  2. Dedup by config fingerprint (address:port:id) BEFORE testing — fast, no I/O
+  3. If XRAY_CHECK_ENABLED: test remaining candidates in parallel via Xray binary
+     (ipcheck.py), dedup by exit IP as well.
+  4. If XRAY_CHECK_ENABLED is False: fall back to serial TCP latency check.
 """
 
 import logging
@@ -143,6 +144,35 @@ def _current_ips(xray_cfg: dict) -> set[str]:
     return addrs
 
 
+def _config_fingerprint(ob: dict) -> str:
+    """
+    Return a unique fingerprint for a candidate outbound based on its
+    connection parameters (address:port:credential).
+
+    This catches exact duplicate configs that happen to return different
+    exit IPs due to load balancers or CDN edge nodes.
+    """
+    proto = ob.get("protocol", "")
+    try:
+        if proto == "vless":
+            s = ob["settings"]
+            return f"vless:{s['address']}:{s['port']}:{s['id']}"
+        elif proto == "vmess":
+            v = ob["settings"]["vnext"][0]
+            return f"vmess:{v['address']}:{v['port']}:{v['users'][0]['id']}"
+        elif proto == "trojan":
+            s = ob["settings"]["servers"][0]
+            return f"trojan:{s['address']}:{s['port']}:{s['password']}"
+        elif proto == "shadowsocks":
+            s = ob["settings"]["servers"][0]
+            return f"ss:{s['address']}:{s['port']}:{s['password']}"
+    except (KeyError, IndexError):
+        pass
+    # Fallback: use _meta address:port
+    meta = ob.get("_meta", {})
+    return f"{proto}:{meta.get('address')}:{meta.get('port')}"
+
+
 def _address_of(outbound: dict) -> str | None:
     return outbound.get("_meta", {}).get("address")
 
@@ -173,18 +203,27 @@ def _collect_candidates_parallel(
 ) -> list[tuple[dict, str]]:
     """
     Parse and test candidates in parallel.
-    Returns up to `needed` (outbound, exit_ip) tuples, deduplicated by exit IP.
+    Dedup by config fingerprint first (fast), then by exit IP after Xray check.
+    Returns up to `needed` (outbound, exit_ip) tuples.
     """
     workers = getattr(config, "XRAY_WORKERS", 5)
     results: list[tuple[dict, str]] = []
-    seen_ips: set[str] = set()
+    seen_fps: set[str] = set()   # config fingerprints seen this run
+    seen_ips: set[str] = set()   # exit IPs seen this run
     lock = threading.Lock()
 
+    # Parse all links and dedup by fingerprint immediately (no I/O cost)
     parsed: list[dict] = []
     for link in candidates:
         ob = converter.parse_link(link)
-        if ob is not None:
-            parsed.append(ob)
+        if ob is None:
+            continue
+        fp = _config_fingerprint(ob)
+        if fp in seen_fps:
+            logger.info("Skipping duplicate config fingerprint: %s", fp)
+            continue
+        seen_fps.add(fp)
+        parsed.append(ob)
 
     if not parsed:
         return []
@@ -230,6 +269,7 @@ def _collect_candidates_serial(
     """Serial TCP-based candidate collection (fallback when XRAY_CHECK_ENABLED=False)."""
     results: list[dict] = []
     used: set[str] = set()
+    seen_fps: set[str] = set()
 
     for link in candidates:
         if len(results) >= needed:
@@ -237,6 +277,11 @@ def _collect_candidates_serial(
         ob = converter.parse_link(link)
         if ob is None:
             continue
+        fp = _config_fingerprint(ob)
+        if fp in seen_fps:
+            logger.info("Skipping duplicate config fingerprint: %s", fp)
+            continue
+        seen_fps.add(fp)
         addr = _address_of(ob)
         if addr and (addr in existing_keys or addr in used):
             logger.info("Skipping duplicate address: %s", addr)
@@ -406,9 +451,7 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     failed_tags: list[str] = []
-    # IPs of healthy slots (used to avoid picking same IP as replacement)
     healthy_ips: set[str] = set()
-    # IPs of failed slots (also excluded from replacements to avoid re-picking same server)
     failed_ips: set[str] = set()
 
     if use_xray:
@@ -443,7 +486,6 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 else:
                     healthy_ips.add(exit_ip)
 
-        # Get exit IPs of failed slots so replacements don't pick the same servers
         failed_slot_obs = [ob for tag, ob in slot_obs if tag in failed_tags]
         if failed_slot_obs:
             with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -480,7 +522,6 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"\u26a0\ufe0f {len(failed_tags)} slot(s) failed: {failed_tags}\nFetching replacements\u2026"
     )
 
-    # existing_keys = healthy slot IPs + failed slot IPs (avoid re-picking same servers)
     existing_keys = healthy_ips | failed_ips
     candidates = scraper.collect_candidate_configs(limit=config.CANDIDATES_TO_FETCH)
     if not candidates:
