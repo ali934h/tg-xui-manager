@@ -43,17 +43,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 HELP_TEXT = """\
-🤖 *tg-xui-manager* — 3x-ui outbound manager
+🤖 *tg\-xui\-manager* \u2014 3x\-ui outbound manager
 
 *Commands:*
-/status — List all managed slots (address / port / protocol)
-/checkall — Health-check all slots; replace failed ones automatically
-/fill N — Fill slots out01…out0N with healthy candidates
-  _Example:_ /fill 10
-/replace 1,5,8 — Force-replace specific slot numbers
-  _Example:_ /replace 3,7
-/setup — Change panel URL, username, or password
-/help — Show this message
+
+/status
+\u2514 List all managed slots
+
+/checkall
+\u2514 Health\-check all slots and replace failed ones
+
+/fill \u2014 Fill slots with healthy configs
+\u2514 Example: `/fill 10`
+
+/replace \u2014 Force\-replace specific slot numbers
+\u2514 Example: `/replace 3,7` or `/replace 1 5 8`
+
+/setup \u2014 Change panel credentials
+
+/help \u2014 Show this message
 """
 
 BOT_COMMANDS = [
@@ -88,13 +96,13 @@ async def _reject(update: Update) -> None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
         return await _reject(update)
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+    await update.message.reply_text(HELP_TEXT, parse_mode="MarkdownV2")
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _allowed(update):
         return await _reject(update)
-    await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
+    await update.message.reply_text(HELP_TEXT, parse_mode="MarkdownV2")
 
 
 # ---------------------------------------------------------------------------
@@ -114,18 +122,17 @@ def _managed_slots(xray_cfg: dict) -> list[dict]:
 
 
 def _current_addresses(xray_cfg: dict) -> set[str]:
-    """Collect all addresses currently used by managed outbounds (string match, no DNS)."""
+    """Collect all addresses currently used by managed outbounds."""
     addrs: set[str] = set()
     for ob in _managed_slots(xray_cfg):
         proto = ob.get("protocol", "")
         try:
-            if proto in ("vless", "vmess"):
-                addr = ob["settings"]["vnext"][0]["address"]
+            if proto in ("vless",):
+                addrs.add(ob["settings"]["address"])
+            elif proto == "vmess":
+                addrs.add(ob["settings"]["vnext"][0]["address"])
             elif proto in ("trojan", "shadowsocks"):
-                addr = ob["settings"]["servers"][0]["address"]
-            else:
-                continue
-            addrs.add(addr)
+                addrs.add(ob["settings"]["servers"][0]["address"])
         except (KeyError, IndexError):
             pass
     return addrs
@@ -323,7 +330,10 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         tag = ob.get("tag", "")
         proto = ob.get("protocol", "")
         try:
-            if proto in ("vless", "vmess"):
+            if proto == "vless":
+                addr = ob["settings"]["address"]
+                port = ob["settings"]["port"]
+            elif proto == "vmess":
                 addr = ob["settings"]["vnext"][0]["address"]
                 port = ob["settings"]["vnext"][0]["port"]
             elif proto in ("trojan", "shadowsocks"):
@@ -412,7 +422,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         tag = ob.get("tag", "?")
         proto = ob.get("protocol", "?")
         try:
-            if proto in ("vless", "vmess"):
+            if proto == "vless":
+                addr = ob["settings"]["address"]
+                port = ob["settings"]["port"]
+            elif proto == "vmess":
                 addr = ob["settings"]["vnext"][0]["address"]
                 port = ob["settings"]["vnext"][0]["port"]
             elif proto in ("trojan", "shadowsocks"):
@@ -442,12 +455,12 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     await update.message.reply_text(
         "⚙️ *Panel setup wizard*\n\n"
-        "*Step 1/3* — Enter the panel base URL.\n\n"
+        "*Step 1/3* — Enter the panel base URL\.\n\n"
         "✅ Correct format:\n"
-        "`https://example.com:2053/mywebpath`\n\n"
-        "❌ Do NOT include /panel or /panel/xray at the end.\n\n"
-        "Send /cancel to abort.",
-        parse_mode="Markdown",
+        "`https://example\.com:2053/mywebpath`\n\n"
+        "❌ Do NOT include /panel or /panel/xray at the end\.\n\n"
+        "Send /cancel to abort\.",
+        parse_mode="MarkdownV2",
     )
     return SETUP_URL
 
@@ -456,31 +469,39 @@ async def setup_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     url = update.message.text.strip().rstrip("/")
     if "/panel" in url:
         await update.message.reply_text(
-            "⚠️ The URL should not include /panel or /panel/xray.\n"
-            "Please re-enter the URL stopping before /panel:"
+            "⚠️ The URL should not include /panel or /panel/xray\.\n"
+            "Please re\-enter the URL stopping before /panel:",
+            parse_mode="MarkdownV2",
         )
         return SETUP_URL
     _setup_data[update.effective_user.id] = {"url": url}
-    await update.message.reply_text("*Step 2/3* — Enter the panel username:", parse_mode="Markdown")
+    await update.message.reply_text(
+        "*Step 2/3* — Enter the panel username:",
+        parse_mode="MarkdownV2",
+    )
     return SETUP_USER
 
 
 async def setup_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _setup_data[update.effective_user.id]["username"] = update.message.text.strip()
-    await update.message.reply_text("*Step 3/3* — Enter the panel password:", parse_mode="Markdown")
+    await update.message.reply_text(
+        "*Step 3/3* — Enter the panel password:",
+        parse_mode="MarkdownV2",
+    )
     return SETUP_PASS
 
 
 async def setup_pass(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _setup_data[update.effective_user.id]["password"] = update.message.text.strip()
     data = _setup_data[update.effective_user.id]
+    escaped_url = data['url'].replace('.', '\\.').replace('/', '\\/').replace('-', '\\-').replace(':', '\\:')
     await update.message.reply_text(
         f"🔍 *Confirm new settings?*\n\n"
-        f"  URL:      `{data['url']}`\n"
+        f"  URL:      `{escaped_url}`\n"
         f"  Username: `{data['username']}`\n"
         f"  Password: `{'*' * len(data['password'])}`\n\n"
-        "Reply *yes* to save, anything else to cancel.",
-        parse_mode="Markdown",
+        "Reply *yes* to save, anything else to cancel\.",
+        parse_mode="MarkdownV2",
     )
     return SETUP_CONFIRM
 
