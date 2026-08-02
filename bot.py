@@ -12,10 +12,9 @@ Commands
 
 Candidate evaluation pipeline:
   1. Parse all candidate links (converter.py)
-  2. Dedup by config fingerprint (address:port:id) — skips candidates already
-     present in existing panel slots AND duplicates within the source list.
-  3. If XRAY_CHECK_ENABLED: test remaining candidates in parallel via Xray binary
-     (ipcheck.py), dedup by exit IP as well.
+  2. Pre-filter: skip if ANY of address / uuid / password matches an existing slot
+  3. If XRAY_CHECK_ENABLED: test remaining candidates in parallel via Xray binary,
+     dedup by exit IP as well.
   4. If XRAY_CHECK_ENABLED is False: fall back to serial TCP latency check.
 """
 
@@ -128,65 +127,85 @@ def _managed_slots(xray_cfg: dict) -> list[dict]:
     return [ob for ob in xray_cfg.get("outbounds", []) if pattern.match(ob.get("tag", ""))]
 
 
-def _current_ips(xray_cfg: dict) -> set[str]:
-    """Collect addresses of existing managed slots for exit-IP dedup."""
-    addrs: set[str] = set()
-    for ob in _managed_slots(xray_cfg):
+class SlotKeys:
+    """
+    Three sets of values extracted from existing panel slots.
+    A candidate is rejected if ANY of its values appear in ANY of these sets.
+
+    addresses   : IP or domain used as the connection target
+    credentials : UUID (vless/vmess) or password (trojan/ss)
+    exit_ips    : real exit IPs obtained via ipcheck (populated later)
+    """
+    def __init__(self):
+        self.addresses:   set[str] = set()
+        self.credentials: set[str] = set()
+        self.exit_ips:    set[str] = set()
+
+    def is_duplicate(self, ob: dict) -> tuple[bool, str]:
+        """
+        Check if outbound `ob` conflicts with any known key.
+        Returns (True, reason) or (False, "").
+        """
         proto = ob.get("protocol", "")
         try:
             if proto == "vless":
-                addrs.add(ob["settings"]["address"])
+                s = ob["settings"]
+                addr = s["address"]
+                cred = s["id"]
             elif proto == "vmess":
-                addrs.add(ob["settings"]["vnext"][0]["address"])
-            elif proto in ("trojan", "shadowsocks"):
-                addrs.add(ob["settings"]["servers"][0]["address"])
-        except (KeyError, IndexError):
+                v = ob["settings"]["vnext"][0]
+                addr = v["address"]
+                cred = v["users"][0]["id"]
+            elif proto == "trojan":
+                s = ob["settings"]["servers"][0]
+                addr = s["address"]
+                cred = s["password"]
+            elif proto == "shadowsocks":
+                s = ob["settings"]["servers"][0]
+                addr = s["address"]
+                cred = s["password"]
+            else:
+                addr = ob.get("_meta", {}).get("address", "")
+                cred = ""
+        except (KeyError, IndexError, TypeError):
+            return False, ""
+
+        if addr and addr in self.addresses:
+            return True, f"duplicate address: {addr}"
+        if cred and cred in self.credentials:
+            return True, f"duplicate credential: {cred[:16]}…"
+        return False, ""
+
+    def add_from_ob(self, ob: dict) -> None:
+        """Register an outbound's address and credential into this set."""
+        proto = ob.get("protocol", "")
+        try:
+            if proto == "vless":
+                s = ob["settings"]
+                self.addresses.add(s["address"])
+                self.credentials.add(s["id"])
+            elif proto == "vmess":
+                v = ob["settings"]["vnext"][0]
+                self.addresses.add(v["address"])
+                self.credentials.add(v["users"][0]["id"])
+            elif proto == "trojan":
+                s = ob["settings"]["servers"][0]
+                self.addresses.add(s["address"])
+                self.credentials.add(s["password"])
+            elif proto == "shadowsocks":
+                s = ob["settings"]["servers"][0]
+                self.addresses.add(s["address"])
+                self.credentials.add(s["password"])
+        except (KeyError, IndexError, TypeError):
             pass
-    return addrs
 
 
-def _config_fingerprint(ob: dict) -> str:
-    """
-    Return a unique fingerprint for an outbound based on its connection
-    parameters: protocol:address:port:credential.
-
-    Used to detect exact duplicate configs — even when a load balancer
-    returns different exit IPs for the same server on repeated checks.
-    Works for both panel outbound dicts and parsed candidate dicts.
-    """
-    proto = ob.get("protocol", "")
-    try:
-        if proto == "vless":
-            # panel format: settings.address / settings.id
-            # candidate format: same (converter.py uses flat format)
-            s = ob["settings"]
-            addr = s.get("address") or ob["settings"]["vnext"][0]["address"] if "vnext" in s else s["address"]
-            port = s.get("port") or ob["settings"]["vnext"][0]["port"] if "vnext" in s else s["port"]
-            uid  = s.get("id")   or ob["settings"]["vnext"][0]["users"][0]["id"] if "vnext" in s else s["id"]
-            return f"vless:{addr}:{port}:{uid}"
-        elif proto == "vmess":
-            v = ob["settings"]["vnext"][0]
-            return f"vmess:{v['address']}:{v['port']}:{v['users'][0]['id']}"
-        elif proto == "trojan":
-            s = ob["settings"]["servers"][0]
-            return f"trojan:{s['address']}:{s['port']}:{s['password']}"
-        elif proto == "shadowsocks":
-            s = ob["settings"]["servers"][0]
-            return f"ss:{s['address']}:{s['port']}:{s['password']}"
-    except (KeyError, IndexError, TypeError):
-        pass
-    meta = ob.get("_meta", {})
-    return f"{proto}:{meta.get('address')}:{meta.get('port')}"
-
-
-def _current_fingerprints(xray_cfg: dict) -> set[str]:
-    """Return fingerprints of ALL managed slots currently on the panel."""
-    fps: set[str] = set()
+def _current_slot_keys(xray_cfg: dict) -> SlotKeys:
+    """Extract address + credential sets from all managed slots on the panel."""
+    keys = SlotKeys()
     for ob in _managed_slots(xray_cfg):
-        fp = _config_fingerprint(ob)
-        if fp:
-            fps.add(fp)
-    return fps
+        keys.add_from_ob(ob)
+    return keys
 
 
 def _address_of(outbound: dict) -> str | None:
@@ -197,16 +216,16 @@ def _address_of(outbound: dict) -> str | None:
 # Parallel candidate fetching (Xray mode)
 # ---------------------------------------------------------------------------
 
-def _check_one(ob: dict, existing_exit_ips: set[str]) -> tuple[dict, str] | None:
+def _check_one(ob: dict, slot_keys: SlotKeys) -> tuple[dict, str] | None:
     """
     Worker: run ipcheck on a single outbound.
-    Returns (outbound, exit_ip) if healthy and exit IP not in existing_exit_ips.
-    existing_exit_ips is read-only — this-run dedup is done in the caller.
+    Returns (outbound, exit_ip) if healthy and exit IP not already seen.
+    slot_keys.exit_ips is read-only here — this-run dedup is in the caller.
     """
     exit_ip = ipcheck.check_outbound(ob)
     if exit_ip is None:
         return None
-    if exit_ip in existing_exit_ips:
+    if exit_ip in slot_keys.exit_ips:
         logger.info("Skipping duplicate exit IP (existing slot): %s", exit_ip)
         return None
     return (ob, exit_ip)
@@ -215,39 +234,78 @@ def _check_one(ob: dict, existing_exit_ips: set[str]) -> tuple[dict, str] | None
 def _collect_candidates_parallel(
     candidates: list[str],
     needed: int,
-    existing_exit_ips: set[str],
-    existing_fps: set[str],
+    slot_keys: SlotKeys,
 ) -> list[tuple[dict, str]]:
     """
     Parse and test candidates in parallel.
 
-    Dedup order (cheapest first):
-      1. Config fingerprint vs existing panel slots (existing_fps) — no I/O
-      2. Config fingerprint vs other candidates in this run — no I/O
-      3. Exit IP vs existing panel slots (existing_exit_ips) — after Xray check
-      4. Exit IP vs other candidates accepted this run — after Xray check
+    Pre-filter (no I/O, per candidate):
+      - address matches any existing slot address → skip
+      - credential (uuid/password) matches any existing slot → skip
+      - address already accepted this run → skip
+      - credential already accepted this run → skip
+
+    Post-filter (after Xray check):
+      - exit IP matches existing slot exit IP → skip
+      - exit IP already accepted this run → skip
 
     Returns up to `needed` (outbound, exit_ip) tuples.
     """
     workers = getattr(config, "XRAY_WORKERS", 5)
-    results: list[tuple[dict, str]] = []
-    # Seed seen_fps with fingerprints of existing panel slots
-    seen_fps: set[str] = set(existing_fps)
-    seen_ips: set[str] = set()
+    results: list[tuple[dict, str]] = []\
+    # Track what we've accepted this run
+    run_addresses:   set[str] = set()
+    run_credentials: set[str] = set()
+    run_exit_ips:    set[str] = set()
     lock = threading.Lock()
 
-    # Parse all links, dedup by fingerprint immediately (no I/O)
+    # Parse and pre-filter all candidate links (no I/O)
     parsed: list[dict] = []
     for link in candidates:
         ob = converter.parse_link(link)
         if ob is None:
             continue
-        fp = _config_fingerprint(ob)
+
+        # Check against existing slots
+        dup, reason = slot_keys.is_duplicate(ob)
+        if dup:
+            logger.info("Skipping (existing slot %s): %s", reason, link[:60])
+            continue
+
+        # Extract address/credential for within-run dedup
+        proto = ob.get("protocol", "")
+        try:
+            if proto == "vless":
+                addr = ob["settings"]["address"]
+                cred = ob["settings"]["id"]
+            elif proto == "vmess":
+                v = ob["settings"]["vnext"][0]
+                addr = v["address"]
+                cred = v["users"][0]["id"]
+            elif proto == "trojan":
+                s = ob["settings"]["servers"][0]
+                addr = s["address"]
+                cred = s["password"]
+            elif proto == "shadowsocks":
+                s = ob["settings"]["servers"][0]
+                addr = s["address"]
+                cred = s["password"]
+            else:
+                addr = ob.get("_meta", {}).get("address", "")
+                cred = ""
+        except (KeyError, IndexError, TypeError):
+            addr, cred = "", ""
+
         with lock:
-            if fp in seen_fps:
-                logger.info("Skipping duplicate config fingerprint: %s", fp)
+            if addr and addr in run_addresses:
+                logger.info("Skipping duplicate address (this run): %s", addr)
                 continue
-            seen_fps.add(fp)
+            if cred and cred in run_credentials:
+                logger.info("Skipping duplicate credential (this run): %s", cred[:16])
+                continue
+            run_addresses.add(addr)
+            run_credentials.add(cred)
+
         parsed.append(ob)
 
     if not parsed:
@@ -261,7 +319,7 @@ def _collect_candidates_parallel(
             batch = parsed[idx: idx + batch_size]
             idx += batch_size
 
-            futures = {executor.submit(_check_one, ob, existing_exit_ips): ob for ob in batch}
+            futures = {executor.submit(_check_one, ob, slot_keys): ob for ob in batch}
 
             for future in as_completed(futures):
                 if len(results) >= needed:
@@ -273,10 +331,10 @@ def _collect_candidates_parallel(
                     continue
                 ob, exit_ip = result
                 with lock:
-                    if exit_ip in seen_ips:
+                    if exit_ip in run_exit_ips:
                         logger.info("Skipping duplicate exit IP (this run): %s", exit_ip)
                         continue
-                    seen_ips.add(exit_ip)
+                    run_exit_ips.add(exit_ip)
                     results.append((ob, exit_ip))
 
     return results[:needed]
@@ -289,13 +347,12 @@ def _collect_candidates_parallel(
 def _collect_candidates_serial(
     candidates: list[str],
     needed: int,
-    existing_keys: set[str],
-    existing_fps: set[str],
+    slot_keys: SlotKeys,
 ) -> list[dict]:
     """Serial TCP-based candidate collection (fallback when XRAY_CHECK_ENABLED=False)."""
     results: list[dict] = []
-    used_addrs: set[str] = set()
-    seen_fps: set[str] = set(existing_fps)
+    run_addresses:   set[str] = set()
+    run_credentials: set[str] = set()
 
     for link in candidates:
         if len(results) >= needed:
@@ -303,19 +360,39 @@ def _collect_candidates_serial(
         ob = converter.parse_link(link)
         if ob is None:
             continue
-        fp = _config_fingerprint(ob)
-        if fp in seen_fps:
-            logger.info("Skipping duplicate config fingerprint: %s", fp)
+
+        dup, reason = slot_keys.is_duplicate(ob)
+        if dup:
+            logger.info("Skipping (existing slot %s): %s", reason, link[:60])
             continue
-        seen_fps.add(fp)
-        addr = _address_of(ob)
-        if addr and (addr in existing_keys or addr in used_addrs):
-            logger.info("Skipping duplicate address: %s", addr)
+
+        proto = ob.get("protocol", "")
+        try:
+            if proto in ("vless",):
+                addr, cred = ob["settings"]["address"], ob["settings"]["id"]
+            elif proto == "vmess":
+                v = ob["settings"]["vnext"][0]
+                addr, cred = v["address"], v["users"][0]["id"]
+            elif proto in ("trojan", "shadowsocks"):
+                s = ob["settings"]["servers"][0]
+                addr, cred = s["address"], s.get("password", "")
+            else:
+                addr, cred = ob.get("_meta", {}).get("address", ""), ""
+        except (KeyError, IndexError, TypeError):
+            addr, cred = "", ""
+
+        if addr and addr in run_addresses:
+            logger.info("Skipping duplicate address (this run): %s", addr)
             continue
+        if cred and cred in run_credentials:
+            logger.info("Skipping duplicate credential (this run): %s", cred[:16])
+            continue
+
         if not healthcheck.is_healthy(ob):
             continue
-        if addr:
-            used_addrs.add(addr)
+
+        run_addresses.add(addr)
+        run_credentials.add(cred)
         results.append(ob)
 
     return results
@@ -356,23 +433,18 @@ async def cmd_fill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"\u274c Panel error: {e}")
         return
 
-    existing_ips = _current_ips(xray_cfg)
-    existing_fps = _current_fingerprints(xray_cfg)
+    slot_keys = _current_slot_keys(xray_cfg)
     candidates = scraper.collect_candidate_configs(limit=config.CANDIDATES_TO_FETCH)
     if not candidates:
         await update.message.reply_text("\u274c Could not fetch candidates from source.")
         return
 
     if use_xray:
-        found = _collect_candidates_parallel(candidates, needed=n,
-                                              existing_exit_ips=existing_ips,
-                                              existing_fps=existing_fps)
+        found = _collect_candidates_parallel(candidates, needed=n, slot_keys=slot_keys)
         tag_to_outbound = {_slot_tag(i + 1): ob for i, (ob, _) in enumerate(found)}
         failed_slots = list(range(len(found) + 1, n + 1)) if len(found) < n else []
     else:
-        found_obs = _collect_candidates_serial(candidates, needed=n,
-                                               existing_keys=existing_ips,
-                                               existing_fps=existing_fps)
+        found_obs = _collect_candidates_serial(candidates, needed=n, slot_keys=slot_keys)
         tag_to_outbound = {_slot_tag(i + 1): ob for i, ob in enumerate(found_obs)}
         failed_slots = list(range(len(found_obs) + 1, n + 1)) if len(found_obs) < n else []
 
@@ -422,23 +494,18 @@ async def cmd_replace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"\u274c Panel error: {e}")
         return
 
-    existing_ips = _current_ips(xray_cfg)
-    existing_fps = _current_fingerprints(xray_cfg)
+    slot_keys = _current_slot_keys(xray_cfg)
     candidates = scraper.collect_candidate_configs(limit=config.CANDIDATES_TO_FETCH)
     if not candidates:
         await update.message.reply_text("\u274c Could not fetch candidates from source.")
         return
 
     if use_xray:
-        found = _collect_candidates_parallel(candidates, needed=n,
-                                              existing_exit_ips=existing_ips,
-                                              existing_fps=existing_fps)
+        found = _collect_candidates_parallel(candidates, needed=n, slot_keys=slot_keys)
         tag_to_outbound = {_slot_tag(slot_numbers[i]): ob for i, (ob, _) in enumerate(found)}
         failed_slots = [slot_numbers[i] for i in range(len(found), n)]
     else:
-        found_obs = _collect_candidates_serial(candidates, needed=n,
-                                               existing_keys=existing_ips,
-                                               existing_fps=existing_fps)
+        found_obs = _collect_candidates_serial(candidates, needed=n, slot_keys=slot_keys)
         tag_to_outbound = {_slot_tag(slot_numbers[i]): ob for i, ob in enumerate(found_obs)}
         failed_slots = [slot_numbers[i] for i in range(len(found_obs), n)]
 
@@ -487,10 +554,8 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     failed_tags: list[str] = []
-    healthy_ips: set[str] = set()
-    failed_ips: set[str] = set()
-    # Fingerprints of ALL current slots (healthy + failed) — excluded from replacements
-    all_fps: set[str] = _current_fingerprints(xray_cfg)
+    # slot_keys will hold addresses+credentials of ALL slots + exit IPs of healthy ones
+    slot_keys = _current_slot_keys(xray_cfg)
 
     if use_xray:
         slot_obs: list[tuple[str, dict]] = []
@@ -522,17 +587,7 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 if exit_ip is None:
                     failed_tags.append(tag)
                 else:
-                    healthy_ips.add(exit_ip)
-
-        # Get exit IPs of failed slots to avoid re-picking same servers
-        failed_slot_obs = [ob for tag, ob in slot_obs if tag in failed_tags]
-        if failed_slot_obs:
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = [executor.submit(ipcheck.check_outbound, ob) for ob in failed_slot_obs]
-                for future in as_completed(futures):
-                    ip = future.result()
-                    if ip:
-                        failed_ips.add(ip)
+                    slot_keys.exit_ips.add(exit_ip)
     else:
         for ob in managed:
             tag = ob.get("tag", "")
@@ -561,9 +616,6 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"\u26a0\ufe0f {len(failed_tags)} slot(s) failed: {failed_tags}\nFetching replacements\u2026"
     )
 
-    existing_exit_ips = healthy_ips | failed_ips
-    # For replacements, exclude fingerprints of ALL current slots (not just failed)
-    # so we never pick a config already present somewhere in the panel
     candidates = scraper.collect_candidate_configs(limit=config.CANDIDATES_TO_FETCH)
     if not candidates:
         await update.message.reply_text("\u274c Could not fetch candidates from source.")
@@ -571,15 +623,11 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     n = len(failed_tags)
     if use_xray:
-        found = _collect_candidates_parallel(candidates, needed=n,
-                                              existing_exit_ips=existing_exit_ips,
-                                              existing_fps=all_fps)
+        found = _collect_candidates_parallel(candidates, needed=n, slot_keys=slot_keys)
         tag_to_outbound = {failed_tags[i]: ob for i, (ob, _) in enumerate(found)}
         still_failed = [failed_tags[i] for i in range(len(found), n)]
     else:
-        found_obs = _collect_candidates_serial(candidates, needed=n,
-                                               existing_keys=existing_exit_ips,
-                                               existing_fps=all_fps)
+        found_obs = _collect_candidates_serial(candidates, needed=n, slot_keys=slot_keys)
         tag_to_outbound = {failed_tags[i]: ob for i, ob in enumerate(found_obs)}
         still_failed = [failed_tags[i] for i in range(len(found_obs), n)]
 
