@@ -5,10 +5,17 @@ Commands
 --------
 /start /help   Show available commands.
 /fill N        Fill slots out01..out0N with healthy, non-duplicate candidates.
-/replace 1,5   Replace specific slots directly (no health check).
-/checkall      Health-check all managed slots; replace only the failed ones.
+/replace 1,5   Replace specific slots directly.
+/checkall      Check all managed slots; replace the failed ones.
 /status        List all managed slots (address / port / protocol).
 /setup         Interactive wizard to change panel URL, username, and password.
+
+Candidate evaluation pipeline (per candidate):
+  1. Parse the subscription link (converter.py)
+  2. If XRAY_CHECK_ENABLED: run a real HTTP request through the Xray binary
+     (ipcheck.py) and get the exit IP. Skip if IP is already seen.
+  3. If XRAY_CHECK_ENABLED is False: fall back to TCP latency check (healthcheck.py)
+     and skip if address string is duplicate.
 """
 
 import logging
@@ -28,6 +35,7 @@ from telegram.ext import (
 import config
 import converter
 import healthcheck
+import ipcheck
 import merger
 import panel_client
 import scraper
@@ -42,35 +50,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-HELP_TEXT = """\
-🤖 *tg\-xui\-manager* \u2014 3x\-ui outbound manager
-
-*Commands:*
-
-/status
-\u2514 List all managed slots
-
-/checkall
-\u2514 Health\-check all slots and replace failed ones
-
-/fill \u2014 Fill slots with healthy configs
-\u2514 Example: `/fill 10`
-
-/replace \u2014 Force\-replace specific slot numbers
-\u2514 Example: `/replace 3,7` or `/replace 1 5 8`
-
-/setup \u2014 Change panel credentials
-
-/help \u2014 Show this message
-"""
+HELP_TEXT = (
+    "\U0001f916 *tg\\-xui\\-manager* \u2014 3x\\-ui outbound manager\n"
+    "\n"
+    "*Commands:*\n"
+    "\n"
+    "/status\n"
+    "\u2514 List all managed slots\n"
+    "\n"
+    "/checkall\n"
+    "\u2514 Check all slots and replace failed ones\n"
+    "\n"
+    "/fill \u2014 Fill slots with healthy configs\n"
+    "\u2514 Example: `/fill 10`\n"
+    "\n"
+    "/replace \u2014 Force\\-replace specific slot numbers\n"
+    "\u2514 Example: `/replace 3,7` or `/replace 1 5 8`\n"
+    "\n"
+    "/setup \u2014 Change panel credentials\n"
+    "\n"
+    "/help \u2014 Show this message\n"
+)
 
 BOT_COMMANDS = [
     BotCommand("start",    "Show help and available commands"),
     BotCommand("help",     "Show help and available commands"),
     BotCommand("status",   "List all managed slots"),
-    BotCommand("checkall", "Health-check all slots and replace failed ones"),
-    BotCommand("fill",     "Fill N slots with healthy configs — e.g. /fill 10"),
-    BotCommand("replace",  "Replace specific slots — e.g. /replace 1,5,8"),
+    BotCommand("checkall", "Check all slots and replace failed ones"),
+    BotCommand("fill",     "Fill N slots with healthy configs \u2014 e.g. /fill 10"),
+    BotCommand("replace",  "Replace specific slots \u2014 e.g. /replace 1,5,8"),
     BotCommand("setup",    "Change panel credentials"),
 ]
 
@@ -83,10 +91,7 @@ def _allowed(update: Update) -> bool:
 
 
 async def _reject(update: Update) -> None:
-    """Silently ignore messages from unauthorised users."""
-    logger.warning(
-        "Unauthorised access attempt from user_id=%s", update.effective_user.id
-    )
+    logger.warning("Unauthorised access attempt from user_id=%s", update.effective_user.id)
 
 
 # ---------------------------------------------------------------------------
@@ -114,20 +119,19 @@ def _slot_tag(n: int) -> str:
 
 
 def _managed_slots(xray_cfg: dict) -> list[dict]:
-    """Return outbounds whose tag matches the managed pattern (out01, out02, …)."""
     pattern = re.compile(
         rf"^{re.escape(config.SLOT_TAG_PREFIX)}\d{{{config.SLOT_TAG_DIGITS}}}$"
     )
     return [ob for ob in xray_cfg.get("outbounds", []) if pattern.match(ob.get("tag", ""))]
 
 
-def _current_addresses(xray_cfg: dict) -> set[str]:
-    """Collect all addresses currently used by managed outbounds."""
+def _current_ips(xray_cfg: dict) -> set[str]:
+    """Collect addresses of existing managed slots (used for address-based dedup fallback)."""
     addrs: set[str] = set()
     for ob in _managed_slots(xray_cfg):
         proto = ob.get("protocol", "")
         try:
-            if proto in ("vless",):
+            if proto == "vless":
                 addrs.add(ob["settings"]["address"])
             elif proto == "vmess":
                 addrs.add(ob["settings"]["vnext"][0]["address"])
@@ -143,25 +147,49 @@ def _address_of(outbound: dict) -> str | None:
 
 
 def _fetch_next_candidate(
-    existing_addresses: set[str],
-    already_used_in_this_run: set[str],
+    existing_keys: set[str],
+    used_this_run: set[str],
     candidates: list[str],
-    candidate_cursor: list[int],
+    cursor: list[int],
 ) -> dict | None:
-    while candidate_cursor[0] < len(candidates):
-        link = candidates[candidate_cursor[0]]
-        candidate_cursor[0] += 1
+    """
+    Walk candidates from cursor position.
+    Each candidate is:
+      - parsed
+      - checked via Xray binary (real HTTP request) if XRAY_CHECK_ENABLED
+        OR via TCP latency if disabled
+      - deduplicated by exit IP (xray mode) or address string (tcp mode)
+
+    Returns the first passing candidate or None if list is exhausted.
+    """
+    use_xray = getattr(config, "XRAY_CHECK_ENABLED", True)
+
+    while cursor[0] < len(candidates):
+        link = candidates[cursor[0]]
+        cursor[0] += 1
+
         ob = converter.parse_link(link)
         if ob is None:
             continue
-        addr = _address_of(ob)
-        if addr and (addr in existing_addresses or addr in already_used_in_this_run):
-            logger.info("Skipping duplicate address: %s", addr)
-            continue
-        if not healthcheck.is_healthy(ob):
-            continue
-        if addr:
-            already_used_in_this_run.add(addr)
+
+        if use_xray:
+            exit_ip = ipcheck.check_outbound(ob)
+            if exit_ip is None:
+                continue
+            if exit_ip in existing_keys or exit_ip in used_this_run:
+                logger.info("Skipping duplicate exit IP: %s", exit_ip)
+                continue
+            used_this_run.add(exit_ip)
+        else:
+            addr = _address_of(ob)
+            if addr and (addr in existing_keys or addr in used_this_run):
+                logger.info("Skipping duplicate address: %s", addr)
+                continue
+            if not healthcheck.is_healthy(ob):
+                continue
+            if addr:
+                used_this_run.add(addr)
+
         return ob
     return None
 
@@ -188,20 +216,22 @@ async def cmd_fill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("N must be >= 1.")
         return
 
-    await update.message.reply_text(f"⏳ Filling {n} slot(s)…")
+    use_xray = getattr(config, "XRAY_CHECK_ENABLED", True)
+    mode_note = "real connectivity check" if use_xray else "TCP latency check"
+    await update.message.reply_text(f"\u23f3 Filling {n} slot(s) using {mode_note}\u2026")
 
     try:
         client = _get_panel()
         client.login()
         xray_cfg = client.get_xray_config()
     except Exception as e:
-        await update.message.reply_text(f"❌ Panel error: {e}")
+        await update.message.reply_text(f"\u274c Panel error: {e}")
         return
 
-    existing_addresses = _current_addresses(xray_cfg)
+    existing_keys = _current_ips(xray_cfg)
     candidates = scraper.collect_candidate_configs(limit=config.CANDIDATES_TO_FETCH)
     if not candidates:
-        await update.message.reply_text("❌ Could not fetch candidates from source.")
+        await update.message.reply_text("\u274c Could not fetch candidates from source.")
         return
 
     cursor = [0]
@@ -210,7 +240,7 @@ async def cmd_fill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     failed_slots: list[int] = []
 
     for i in range(1, n + 1):
-        ob = _fetch_next_candidate(existing_addresses, used_this_run, candidates, cursor)
+        ob = _fetch_next_candidate(existing_keys, used_this_run, candidates, cursor)
         if ob is None:
             failed_slots.append(i)
         else:
@@ -221,18 +251,15 @@ async def cmd_fill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             client.save_xray_config(xray_cfg)
         except Exception as e:
-            await update.message.reply_text(f"❌ Failed to save config: {e}")
+            await update.message.reply_text(f"\u274c Failed to save config: {e}")
             return
 
-    lines = [f"✅ /fill {n} done."]
-    for tag in tag_to_outbound:
-        ob = tag_to_outbound[tag]
+    lines = [f"\u2705 /fill {n} done."]
+    for tag, ob in tag_to_outbound.items():
         meta = ob.get("_meta", {})
-        lines.append(
-            f"  {tag}  →  {meta.get('address')}:{meta.get('port')}  [{ob.get('protocol')}]"
-        )
+        lines.append(f"  {tag}  \u2192  {meta.get('address')}:{meta.get('port')}  [{ob.get('protocol')}]")
     if failed_slots:
-        lines.append(f"\n⚠️ No healthy candidate found for slot(s): {failed_slots}")
+        lines.append(f"\n\u26a0\ufe0f No healthy candidate found for slot(s): {failed_slots}")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -248,25 +275,23 @@ async def cmd_replace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     raw = " ".join(context.args)
     slot_numbers = [int(x) for x in re.findall(r"\d+", raw)]
     if not slot_numbers:
-        await update.message.reply_text(
-            "Usage: /replace <slot numbers>\nExample: /replace 1,5,8"
-        )
+        await update.message.reply_text("Usage: /replace <slot numbers>\nExample: /replace 1,5,8")
         return
 
-    await update.message.reply_text(f"⏳ Replacing slot(s): {slot_numbers}…")
+    await update.message.reply_text(f"\u23f3 Replacing slot(s): {slot_numbers}\u2026")
 
     try:
         client = _get_panel()
         client.login()
         xray_cfg = client.get_xray_config()
     except Exception as e:
-        await update.message.reply_text(f"❌ Panel error: {e}")
+        await update.message.reply_text(f"\u274c Panel error: {e}")
         return
 
-    existing_addresses = _current_addresses(xray_cfg)
+    existing_keys = _current_ips(xray_cfg)
     candidates = scraper.collect_candidate_configs(limit=config.CANDIDATES_TO_FETCH)
     if not candidates:
-        await update.message.reply_text("❌ Could not fetch candidates from source.")
+        await update.message.reply_text("\u274c Could not fetch candidates from source.")
         return
 
     cursor = [0]
@@ -275,7 +300,7 @@ async def cmd_replace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     failed_slots: list[int] = []
 
     for i in slot_numbers:
-        ob = _fetch_next_candidate(existing_addresses, used_this_run, candidates, cursor)
+        ob = _fetch_next_candidate(existing_keys, used_this_run, candidates, cursor)
         if ob is None:
             failed_slots.append(i)
         else:
@@ -286,18 +311,15 @@ async def cmd_replace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             client.save_xray_config(xray_cfg)
         except Exception as e:
-            await update.message.reply_text(f"❌ Failed to save config: {e}")
+            await update.message.reply_text(f"\u274c Failed to save config: {e}")
             return
 
-    lines = [f"✅ /replace done."]
-    for tag in tag_to_outbound:
-        ob = tag_to_outbound[tag]
+    lines = ["\u2705 /replace done."]
+    for tag, ob in tag_to_outbound.items():
         meta = ob.get("_meta", {})
-        lines.append(
-            f"  {tag}  →  {meta.get('address')}:{meta.get('port')}  [{ob.get('protocol')}]"
-        )
+        lines.append(f"  {tag}  \u2192  {meta.get('address')}:{meta.get('port')}  [{ob.get('protocol')}]")
     if failed_slots:
-        lines.append(f"\n⚠️ No candidate found for slot(s): {failed_slots}")
+        lines.append(f"\n\u26a0\ufe0f No candidate found for slot(s): {failed_slots}")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -310,14 +332,16 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not _allowed(update):
         return await _reject(update)
 
-    await update.message.reply_text("⏳ Running health check on all managed slots…")
+    use_xray = getattr(config, "XRAY_CHECK_ENABLED", True)
+    mode_note = "real connectivity check" if use_xray else "TCP latency check"
+    await update.message.reply_text(f"\u23f3 Checking all managed slots ({mode_note})\u2026")
 
     try:
         client = _get_panel()
         client.login()
         xray_cfg = client.get_xray_config()
     except Exception as e:
-        await update.message.reply_text(f"❌ Panel error: {e}")
+        await update.message.reply_text(f"\u274c Panel error: {e}")
         return
 
     managed = _managed_slots(xray_cfg)
@@ -326,6 +350,8 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     failed_tags: list[str] = []
+    seen_ips: set[str] = set()
+
     for ob in managed:
         tag = ob.get("tag", "")
         proto = ob.get("protocol", "")
@@ -346,22 +372,32 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             failed_tags.append(tag)
             continue
 
-        synthetic = {"_meta": {"address": addr, "port": port}}
-        if not healthcheck.is_healthy(synthetic):
-            failed_tags.append(tag)
+        if use_xray:
+            # Build a synthetic outbound with _meta for ipcheck
+            check_ob = dict(ob)
+            check_ob["_meta"] = {"address": addr, "port": port}
+            exit_ip = ipcheck.check_outbound(check_ob)
+            if exit_ip is None:
+                failed_tags.append(tag)
+            else:
+                seen_ips.add(exit_ip)
+        else:
+            synthetic = {"_meta": {"address": addr, "port": port}}
+            if not healthcheck.is_healthy(synthetic):
+                failed_tags.append(tag)
 
     if not failed_tags:
-        await update.message.reply_text("✅ All slots are healthy. Nothing to replace.")
+        await update.message.reply_text("\u2705 All slots are healthy. Nothing to replace.")
         return
 
     await update.message.reply_text(
-        f"⚠️ {len(failed_tags)} slot(s) failed: {failed_tags}\nFetching replacements…"
+        f"\u26a0\ufe0f {len(failed_tags)} slot(s) failed: {failed_tags}\nFetching replacements\u2026"
     )
 
-    existing_addresses = _current_addresses(xray_cfg)
+    existing_keys = _current_ips(xray_cfg) | seen_ips
     candidates = scraper.collect_candidate_configs(limit=config.CANDIDATES_TO_FETCH)
     if not candidates:
-        await update.message.reply_text("❌ Could not fetch candidates from source.")
+        await update.message.reply_text("\u274c Could not fetch candidates from source.")
         return
 
     cursor = [0]
@@ -370,7 +406,7 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     still_failed: list[str] = []
 
     for tag in failed_tags:
-        ob = _fetch_next_candidate(existing_addresses, used_this_run, candidates, cursor)
+        ob = _fetch_next_candidate(existing_keys, used_this_run, candidates, cursor)
         if ob is None:
             still_failed.append(tag)
         else:
@@ -381,17 +417,15 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try:
             client.save_xray_config(xray_cfg)
         except Exception as e:
-            await update.message.reply_text(f"❌ Failed to save config: {e}")
+            await update.message.reply_text(f"\u274c Failed to save config: {e}")
             return
 
-    lines = [f"✅ /checkall done."]
+    lines = ["\u2705 /checkall done."]
     for tag, ob in tag_to_outbound.items():
         meta = ob.get("_meta", {})
-        lines.append(
-            f"  {tag}  →  {meta.get('address')}:{meta.get('port')}  [{ob.get('protocol')}]"
-        )
+        lines.append(f"  {tag}  \u2192  {meta.get('address')}:{meta.get('port')}  [{ob.get('protocol')}]")
     if still_failed:
-        lines.append(f"\n⚠️ Could not find replacement for: {still_failed}")
+        lines.append(f"\n\u26a0\ufe0f Could not find replacement for: {still_failed}")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -409,7 +443,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         client.login()
         xray_cfg = client.get_xray_config()
     except Exception as e:
-        await update.message.reply_text(f"❌ Panel error: {e}")
+        await update.message.reply_text(f"\u274c Panel error: {e}")
         return
 
     managed = sorted(_managed_slots(xray_cfg), key=lambda ob: ob.get("tag", ""))
@@ -417,7 +451,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("No managed slots found on panel.")
         return
 
-    lines = [f"📋 {len(managed)} managed slot(s):\n"]
+    lines = [f"\U0001f4cb {len(managed)} managed slot(s):\n"]
     for ob in managed:
         tag = ob.get("tag", "?")
         proto = ob.get("protocol", "?")
@@ -454,13 +488,12 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     await update.message.reply_text(
-        "⚙️ *Panel setup wizard*\n\n"
-        "*Step 1/3* — Enter the panel base URL\.\n\n"
-        "✅ Correct format:\n"
-        "`https://example\.com:2053/mywebpath`\n\n"
-        "❌ Do NOT include /panel or /panel/xray at the end\.\n\n"
-        "Send /cancel to abort\.",
-        parse_mode="MarkdownV2",
+        "\u2699\ufe0f Panel setup wizard\n\n"
+        "Step 1/3 \u2014 Enter the panel base URL.\n\n"
+        "\u2705 Correct format:\n"
+        "https://example.com:2053/mywebpath\n\n"
+        "\u274c Do NOT include /panel or /panel/xray at the end.\n\n"
+        "Send /cancel to abort."
     )
     return SETUP_URL
 
@@ -469,39 +502,30 @@ async def setup_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     url = update.message.text.strip().rstrip("/")
     if "/panel" in url:
         await update.message.reply_text(
-            "⚠️ The URL should not include /panel or /panel/xray\.\n"
-            "Please re\-enter the URL stopping before /panel:",
-            parse_mode="MarkdownV2",
+            "\u26a0\ufe0f The URL should not include /panel or /panel/xray.\n"
+            "Please re-enter the URL stopping before /panel:"
         )
         return SETUP_URL
     _setup_data[update.effective_user.id] = {"url": url}
-    await update.message.reply_text(
-        "*Step 2/3* — Enter the panel username:",
-        parse_mode="MarkdownV2",
-    )
+    await update.message.reply_text("Step 2/3 \u2014 Enter the panel username:")
     return SETUP_USER
 
 
 async def setup_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _setup_data[update.effective_user.id]["username"] = update.message.text.strip()
-    await update.message.reply_text(
-        "*Step 3/3* — Enter the panel password:",
-        parse_mode="MarkdownV2",
-    )
+    await update.message.reply_text("Step 3/3 \u2014 Enter the panel password:")
     return SETUP_PASS
 
 
 async def setup_pass(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _setup_data[update.effective_user.id]["password"] = update.message.text.strip()
     data = _setup_data[update.effective_user.id]
-    escaped_url = data['url'].replace('.', '\\.').replace('/', '\\/').replace('-', '\\-').replace(':', '\\:')
     await update.message.reply_text(
-        f"🔍 *Confirm new settings?*\n\n"
-        f"  URL:      `{escaped_url}`\n"
-        f"  Username: `{data['username']}`\n"
-        f"  Password: `{'*' * len(data['password'])}`\n\n"
-        "Reply *yes* to save, anything else to cancel\.",
-        parse_mode="MarkdownV2",
+        f"\U0001f50d Confirm new settings?\n\n"
+        f"  URL:      {data['url']}\n"
+        f"  Username: {data['username']}\n"
+        f"  Password: {'*' * len(data['password'])}\n\n"
+        "Reply yes to save, anything else to cancel."
     )
     return SETUP_CONFIRM
 
@@ -509,13 +533,13 @@ async def setup_pass(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def setup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
     if update.message.text.strip().lower() != "yes":
-        await update.message.reply_text("❌ Setup cancelled.")
+        await update.message.reply_text("\u274c Setup cancelled.")
         _setup_data.pop(uid, None)
         return ConversationHandler.END
 
     data = _setup_data.pop(uid, {})
 
-    await update.message.reply_text("⏳ Testing credentials…")
+    await update.message.reply_text("\u23f3 Testing credentials\u2026")
     try:
         test_client = panel_client.PanelClient(
             base_url=data["url"],
@@ -525,7 +549,7 @@ async def setup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         test_client.login()
     except Exception as e:
         await update.message.reply_text(
-            f"❌ Could not login with the provided credentials:\n{e}\n\nSetup aborted."
+            f"\u274c Could not login with the provided credentials:\n{e}\n\nSetup aborted."
         )
         return ConversationHandler.END
 
@@ -535,10 +559,10 @@ async def setup_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     try:
         _write_config(data["url"], data["username"], data["password"])
-        await update.message.reply_text("✅ Panel credentials saved and verified.")
+        await update.message.reply_text("\u2705 Panel credentials saved and verified.")
     except Exception as e:
         await update.message.reply_text(
-            f"✅ Credentials applied for this session, but could not write to config.py:\n{e}"
+            f"\u2705 Credentials applied for this session, but could not write to config.py:\n{e}"
         )
 
     return ConversationHandler.END
@@ -569,7 +593,7 @@ def _write_config(url: str, username: str, password: str) -> None:
 
 async def setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _setup_data.pop(update.effective_user.id, None)
-    await update.message.reply_text("❌ Setup cancelled.")
+    await update.message.reply_text("\u274c Setup cancelled.")
     return ConversationHandler.END
 
 
@@ -613,7 +637,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(setup_conv)
 
-    logger.info("Bot started. Polling…")
+    logger.info("Bot started. Polling\u2026")
     app.run_polling(drop_pending_updates=True)
 
 

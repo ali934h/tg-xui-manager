@@ -23,7 +23,24 @@ ALLOWED_USERS = [123456789]
 SLOT_TAG_PREFIX = "out"    # -> out01, out02, ...
 SLOT_TAG_DIGITS = 2
 
-# ---------- Health Check ----------
+# ---------- Candidate Check ----------
+# XRAY_CHECK: use the local Xray binary to make a real HTTP request through
+# each candidate and verify connectivity + get the real exit IP.
+# This is slower but far more accurate than TCP-only check.
+# Set to False to fall back to TCP latency check only.
+XRAY_CHECK_ENABLED = True
+
+# Xray binary path (installed by 3x-ui at this location)
+XRAY_BINARY = "/usr/local/x-ui/bin/xray-linux-amd64"
+
+# Seconds to wait for the Xray process to start before sending traffic
+XRAY_STARTUP_WAIT_SEC = 2.0
+
+# HTTP request timeout (seconds) when checking through SOCKS5
+XRAY_REQUEST_TIMEOUT_SEC = 8
+
+# ---------- Health Check (TCP fallback) ----------
+# Used only when XRAY_CHECK_ENABLED = False
 MAX_LATENCY_MS = 350
 TCP_CONNECT_TIMEOUT_SEC = 4
 
