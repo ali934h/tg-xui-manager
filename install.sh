@@ -9,7 +9,7 @@ SERVICE_NAME="tg-xui-manager"
 PYTHON="python3"
 
 # Preferred Xray version (tested and confirmed working with this project).
-# If this release is unavailable, the installer falls back to latest.
+# If this release is unavailable on GitHub, the installer falls back to latest.
 XRAY_PREFERRED_VERSION="v26.4.25"
 XRAY_INSTALL_DIR="/root/tg-xui-manager-xray"
 XRAY_BINARY="$XRAY_INSTALL_DIR/xray"
@@ -22,47 +22,37 @@ apt-get update -qq
 apt-get install -y -qq python3 python3-venv python3-pip git curl unzip
 
 # ---------- Xray binary ----------
-echo "[2/6] Setting up Xray binary…"
+echo "[2/6] Downloading Xray binary…"
+mkdir -p "$XRAY_INSTALL_DIR"
 
-# Check if 3x-ui's own xray is available (same server installation)
-XUI_XRAY="/usr/local/x-ui/bin/xray-linux-amd64"
-if [ -x "$XUI_XRAY" ]; then
-    echo "  Found 3x-ui Xray at $XUI_XRAY — using it directly."
-    XRAY_BINARY="$XUI_XRAY"
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64)  XRAY_ARCH="64" ;;
+    aarch64) XRAY_ARCH="arm64-v8a" ;;
+    armv7l)  XRAY_ARCH="arm32-v7a" ;;
+    *)       XRAY_ARCH="64" ;;
+esac
+
+PREFERRED_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_PREFERRED_VERSION}/Xray-linux-${XRAY_ARCH}.zip"
+LATEST_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XRAY_ARCH}.zip"
+
+echo "  Trying preferred version ${XRAY_PREFERRED_VERSION}…"
+if curl -fsSL --head "$PREFERRED_URL" -o /dev/null 2>/dev/null; then
+    DOWNLOAD_URL="$PREFERRED_URL"
+    echo "  ✅ Preferred version available."
 else
-    echo "  3x-ui Xray not found — downloading standalone Xray binary…"
-    mkdir -p "$XRAY_INSTALL_DIR"
-
-    ARCH="$(uname -m)"
-    case "$ARCH" in
-        x86_64)  XRAY_ARCH="64" ;;
-        aarch64) XRAY_ARCH="arm64-v8a" ;;
-        armv7l)  XRAY_ARCH="arm32-v7a" ;;
-        *)       XRAY_ARCH="64" ;;
-    esac
-
-    # Try preferred version first, fall back to latest
-    PREFERRED_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_PREFERRED_VERSION}/Xray-linux-${XRAY_ARCH}.zip"
-    LATEST_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XRAY_ARCH}.zip"
-
-    echo "  Trying preferred version ${XRAY_PREFERRED_VERSION}…"
-    if curl -fsSL --head "$PREFERRED_URL" -o /dev/null 2>/dev/null; then
-        DOWNLOAD_URL="$PREFERRED_URL"
-        echo "  ✅ Preferred version available."
-    else
-        echo "  ⚠️  Preferred version not available — falling back to latest."
-        DOWNLOAD_URL="$LATEST_URL"
-    fi
-
-    TMP_ZIP="$(mktemp /tmp/xray-XXXXXX.zip)"
-    curl -fsSL "$DOWNLOAD_URL" -o "$TMP_ZIP"
-    unzip -o -q "$TMP_ZIP" -d "$XRAY_INSTALL_DIR"
-    rm -f "$TMP_ZIP"
-    chmod +x "$XRAY_BINARY"
-
-    XRAY_VER="$("$XRAY_BINARY" version 2>/dev/null | head -1 || echo 'unknown')"
-    echo "  Xray installed: $XRAY_VER"
+    echo "  ⚠️  Preferred version not available — falling back to latest."
+    DOWNLOAD_URL="$LATEST_URL"
 fi
+
+TMP_ZIP="$(mktemp /tmp/xray-XXXXXX.zip)"
+curl -fsSL "$DOWNLOAD_URL" -o "$TMP_ZIP"
+unzip -o -q "$TMP_ZIP" -d "$XRAY_INSTALL_DIR"
+rm -f "$TMP_ZIP"
+chmod +x "$XRAY_BINARY"
+
+XRAY_VER="$("$XRAY_BINARY" version 2>/dev/null | head -1 || echo 'unknown')"
+echo "  Xray installed: $XRAY_VER"
 
 # ---------- clone / update ----------
 echo "[3/6] Cloning repository…"
@@ -121,7 +111,7 @@ sed -i "s|BOT_TOKEN = .*|BOT_TOKEN = \"$BOT_TOKEN\"|" "$CONFIG_FILE"
 sed -i "s|ALLOWED_USERS = .*|ALLOWED_USERS = $ALLOWED_LIST|" "$CONFIG_FILE"
 sed -i "s|XRAY_BINARY = .*|XRAY_BINARY = \"$XRAY_BINARY\"|" "$CONFIG_FILE"
 
-# Append Xray worker settings if not present
+# Append extra settings if not present
 grep -q "XRAY_WORKERS" "$CONFIG_FILE" || cat >> "$CONFIG_FILE" << 'EOFCFG'
 
 # ---------- Parallel Workers ----------
