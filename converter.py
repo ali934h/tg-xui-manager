@@ -1,21 +1,22 @@
 """
 Parse subscription links (vless://, vmess://, trojan://, ss://) into
-Xray-compatible outbound dicts ready to be inserted into the panel config.
+outbound dicts compatible with the 3x-ui panel (v2.9.3).
 
-Each parser returns a dict like:
-{
-    "protocol": "...",
-    "settings": {...},
-    "streamSettings": {...},
-    "_meta": {"address": ..., "port": ...}   # removed before sending to panel
-}
-or None on parse failure.
+Verified against web/assets/js/model/outbound.js from 3x-ui source:
+
+  VLESS  settings: {address, port, id, flow, encryption}          ← flat (panel format)
+  VMess  settings: {vnext: [{address, port, users: [{id, security}]}]}
+  Trojan settings: {servers: [{address, port, password}]}
+  SS     settings: {servers: [{address, port, method, password}]}
+
+Each parser also attaches a "_meta" key for internal health-check use.
+merger.py strips _meta before sending the config to the panel.
 """
 
 import base64
 import json
 import logging
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,8 @@ def _build_stream_settings(
     if net == "ws":
         stream["wsSettings"] = {
             "path": _p(params, "path", "/"),
-            "headers": {"Host": _p(params, "host")},
+            "host": _p(params, "host"),
+            "heartbeatPeriod": 0,
         }
     elif net == "grpc":
         stream["grpcSettings"] = {"serviceName": _p(params, "serviceName")}
@@ -55,6 +57,8 @@ def _build_stream_settings(
         allow_insecure = _p(params, "allowInsecure", "0")
         stream["tlsSettings"] = {
             "serverName": sni,
+            "alpn": [],
+            "fingerprint": _p(params, "fp", "chrome"),
             "allowInsecure": allow_insecure in ("1", "true", "True"),
         }
     elif security == "reality":
@@ -64,6 +68,7 @@ def _build_stream_settings(
             "publicKey": _p(params, "pbk"),
             "shortId": _p(params, "sid"),
             "fingerprint": _p(params, "fp", "chrome"),
+            "spiderX": _p(params, "spx", ""),
         }
     else:
         stream["security"] = "none"
@@ -72,27 +77,24 @@ def _build_stream_settings(
 
 
 def parse_vless(link: str) -> dict | None:
+    """
+    VLESS outbound settings use a flat structure in 3x-ui (not vnext).
+    Source: Outbound.VLESSSettings.toJson() in outbound.js
+    """
     try:
         parsed = urlparse(link)
         params = parse_qs(parsed.query)
         address = parsed.hostname
         port = parsed.port
+
         outbound = {
             "protocol": "vless",
             "settings": {
-                "vnext": [
-                    {
-                        "address": address,
-                        "port": port,
-                        "users": [
-                            {
-                                "id": parsed.username,
-                                "encryption": "none",
-                                "flow": _p(params, "flow"),
-                            }
-                        ],
-                    }
-                ]
+                "address": address,
+                "port": port,
+                "id": parsed.username,
+                "flow": _p(params, "flow"),
+                "encryption": _p(params, "encryption", "none"),
             },
             "streamSettings": _build_stream_settings(
                 _p(params, "type", "tcp"),
@@ -109,11 +111,16 @@ def parse_vless(link: str) -> dict | None:
 
 
 def parse_trojan(link: str) -> dict | None:
+    """
+    Trojan settings: servers array.
+    Source: Outbound.TrojanSettings.toJson() in outbound.js
+    """
     try:
         parsed = urlparse(link)
         params = parse_qs(parsed.query)
         address = parsed.hostname
         port = parsed.port
+
         outbound = {
             "protocol": "trojan",
             "settings": {
@@ -140,8 +147,12 @@ def parse_trojan(link: str) -> dict | None:
 
 
 def parse_vmess(link: str) -> dict | None:
+    """
+    VMess settings: vnext array (same as Xray core format).
+    Source: Outbound.VmessSettings.toJson() in outbound.js
+    """
     try:
-        data = json.loads(_b64_decode(link[len("vmess://") :]))
+        data = json.loads(_b64_decode(link[len("vmess://"):]))
         address = data.get("add")
         port = int(data.get("port"))
         host = data.get("host", "")
@@ -150,8 +161,10 @@ def parse_vmess(link: str) -> dict | None:
             "host": [host],
             "path": [data.get("path", "/")],
             "sni": [sni],
+            "fp": [data.get("fp", "chrome")],
             "headerType": [data.get("type", "none")],
         }
+
         outbound = {
             "protocol": "vmess",
             "settings": {
@@ -163,7 +176,7 @@ def parse_vmess(link: str) -> dict | None:
                             {
                                 "id": data.get("id"),
                                 "alterId": int(data.get("aid", 0)),
-                                "security": "auto",
+                                "security": data.get("scy", "auto"),
                             }
                         ],
                     }
@@ -184,8 +197,12 @@ def parse_vmess(link: str) -> dict | None:
 
 
 def parse_shadowsocks(link: str) -> dict | None:
+    """
+    Shadowsocks settings: servers array.
+    Source: Outbound.ShadowsocksSettings.toJson() in outbound.js
+    """
     try:
-        body = link[len("ss://") :].split("#", 1)[0]
+        body = link[len("ss://"):].split("#", 1)[0]
         if "@" in body:
             userinfo_part, hostport_part = body.split("@", 1)
             try:
