@@ -15,7 +15,7 @@ import logging
 import re
 import sys
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -55,6 +55,16 @@ HELP_TEXT = """\
 /setup — Change panel URL, username, or password
 /help — Show this message
 """
+
+BOT_COMMANDS = [
+    BotCommand("start",    "Show help and available commands"),
+    BotCommand("help",     "Show help and available commands"),
+    BotCommand("status",   "List all managed slots"),
+    BotCommand("checkall", "Health-check all slots and replace failed ones"),
+    BotCommand("fill",     "Fill N slots with healthy configs — e.g. /fill 10"),
+    BotCommand("replace",  "Replace specific slots — e.g. /replace 1,5,8"),
+    BotCommand("setup",    "Change panel credentials"),
+]
 
 # ---------------------------------------------------------------------------
 # Auth guard
@@ -444,7 +454,6 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def setup_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     url = update.message.text.strip().rstrip("/")
-    # Warn if user included /panel in the URL
     if "/panel" in url:
         await update.message.reply_text(
             "⚠️ The URL should not include /panel or /panel/xray.\n"
@@ -544,11 +553,25 @@ async def setup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 # ---------------------------------------------------------------------------
+# Post-init: register command menu with Telegram
+# ---------------------------------------------------------------------------
+
+async def post_init(app: Application) -> None:
+    await app.bot.set_my_commands(BOT_COMMANDS)
+    logger.info("Bot command menu registered with Telegram.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    app = Application.builder().token(config.BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(config.BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     setup_conv = ConversationHandler(
         entry_points=[CommandHandler("setup", cmd_setup)],
