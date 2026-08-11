@@ -16,12 +16,18 @@ Candidate evaluation pipeline:
   3. If XRAY_CHECK_ENABLED: test remaining candidates in parallel via Xray binary,
      dedup by exit IP as well.
   4. If XRAY_CHECK_ENABLED is False: fall back to serial TCP latency check.
+
+Every config save is followed by a full Xray restart (see _save_and_restart)
+to clear stale connection/DNS/mux state left over from long uptime —
+otherwise outbounds can intermittently fail external health checks even
+though the config itself is correct.
 """
 
 import logging
 import re
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from telegram import BotCommand, Update
@@ -212,6 +218,35 @@ def _address_of(outbound: dict) -> str | None:
     return outbound.get("_meta", {}).get("address")
 
 
+def _save_and_restart(client: "panel_client.PanelClient", xray_cfg: dict) -> str | None:
+    """
+    Save the Xray config, then force a full process restart.
+
+    save_xray_config() only hot-reloads — it does not clear stale connection
+    pools, DNS cache, or mux state accumulated over long Xray uptime. Left
+    uncleared, that stale state can make external health checkers (e.g. a
+    9Router proxy pool test) intermittently report ECONNRESET/timeouts on
+    outbounds that are actually fine. A full restart clears it.
+
+    Returns an error message string on failure, or None on success.
+    Restart failures are logged but do not fail the overall operation,
+    since the config itself was already saved successfully.
+    """
+    try:
+        client.save_xray_config(xray_cfg)
+    except Exception as e:
+        return f"Failed to save config: {e}"
+
+    if getattr(config, "RESTART_XRAY_AFTER_SAVE", True):
+        try:
+            client.restart_xray()
+            time.sleep(getattr(config, "XRAY_RESTART_WAIT_SEC", 3))
+        except Exception as e:
+            logger.warning("Xray restart failed (config was saved): %s", e)
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Parallel candidate fetching (Xray mode)
 # ---------------------------------------------------------------------------
@@ -252,7 +287,7 @@ def _collect_candidates_parallel(
     Returns up to `needed` (outbound, exit_ip) tuples.
     """
     workers = getattr(config, "XRAY_WORKERS", 5)
-    results: list[tuple[dict, str]] = []\
+    results: list[tuple[dict, str]] = []
     # Track what we've accepted this run
     run_addresses:   set[str] = set()
     run_credentials: set[str] = set()
@@ -450,10 +485,9 @@ async def cmd_fill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if tag_to_outbound:
         xray_cfg = merger.replace_outbounds(xray_cfg, tag_to_outbound)
-        try:
-            client.save_xray_config(xray_cfg)
-        except Exception as e:
-            await update.message.reply_text(f"\u274c Failed to save config: {e}")
+        err = _save_and_restart(client, xray_cfg)
+        if err:
+            await update.message.reply_text(f"\u274c {err}")
             return
 
     lines = [f"\u2705 /fill {n} done."]
@@ -511,10 +545,9 @@ async def cmd_replace(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if tag_to_outbound:
         xray_cfg = merger.replace_outbounds(xray_cfg, tag_to_outbound)
-        try:
-            client.save_xray_config(xray_cfg)
-        except Exception as e:
-            await update.message.reply_text(f"\u274c Failed to save config: {e}")
+        err = _save_and_restart(client, xray_cfg)
+        if err:
+            await update.message.reply_text(f"\u274c {err}")
             return
 
     lines = ["\u2705 /replace done."]
@@ -633,10 +666,9 @@ async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if tag_to_outbound:
         xray_cfg = merger.replace_outbounds(xray_cfg, tag_to_outbound)
-        try:
-            client.save_xray_config(xray_cfg)
-        except Exception as e:
-            await update.message.reply_text(f"\u274c Failed to save config: {e}")
+        err = _save_and_restart(client, xray_cfg)
+        if err:
+            await update.message.reply_text(f"\u274c {err}")
             return
 
     lines = ["\u2705 /checkall done."]

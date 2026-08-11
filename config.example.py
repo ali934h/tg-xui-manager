@@ -44,6 +44,19 @@ XRAY_STARTUP_WAIT_SEC = 2.0
 # HTTP request timeout (seconds) when checking through SOCKS5
 XRAY_REQUEST_TIMEOUT_SEC = 8
 
+# ---------- Post-save Xray restart ----------
+# save_xray_config() only hot-reloads the running Xray process. That does
+# NOT clear stale connection pools, DNS cache, or mux session state built up
+# over long uptime -- which can make external health checkers (e.g. a
+# 9Router proxy pool test) intermittently report failures (ECONNRESET /
+# timeouts) on outbounds that are actually fine. When enabled, the bot
+# forces a full Xray-core process restart after every config save.
+RESTART_XRAY_AFTER_SAVE = True
+
+# Seconds to wait after triggering a restart before the command finishes,
+# so Xray is fully back up before you (or an external checker) test again.
+XRAY_RESTART_WAIT_SEC = 3
+
 # ---------- Health Check (TCP fallback) ----------
 # Used only when XRAY_CHECK_ENABLED = False
 MAX_LATENCY_MS = 350
