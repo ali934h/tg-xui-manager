@@ -2,6 +2,9 @@
 .env
 config.py
 
+# Runtime state (not code)
+slots_meta.json
+
 # Python
 __pycache__/
 *.pyc
