@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tg-xui-manager installer
 # Run as root: bash <(curl -fsSL https://raw.githubusercontent.com/ali934h/tg-xui-manager/main/install.sh)
+
 set -e
 
 REPO="https://github.com/ali934h/tg-xui-manager.git"
@@ -27,10 +28,10 @@ mkdir -p "$XRAY_INSTALL_DIR"
 
 ARCH="$(uname -m)"
 case "$ARCH" in
-    x86_64)  XRAY_ARCH="64" ;;
+    x86_64) XRAY_ARCH="64" ;;
     aarch64) XRAY_ARCH="arm64-v8a" ;;
-    armv7l)  XRAY_ARCH="arm32-v7a" ;;
-    *)       XRAY_ARCH="64" ;;
+    armv7l) XRAY_ARCH="arm32-v7a" ;;
+    *) XRAY_ARCH="64" ;;
 esac
 
 PREFERRED_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_PREFERRED_VERSION}/Xray-linux-${XRAY_ARCH}.zip"
@@ -72,7 +73,6 @@ $PYTHON -m venv "$INSTALL_DIR/venv"
 # ---------- config ----------
 echo "[5/6] Configuration…"
 CONFIG_FILE="$INSTALL_DIR/config.py"
-
 if [ ! -f "$CONFIG_FILE" ]; then
     cp "$INSTALL_DIR/config.example.py" "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE"
@@ -82,7 +82,7 @@ echo ""
 echo "  Panel base URL — the URL up to (but NOT including) /panel"
 echo "  Example: https://example.com:2053/mywebbasepath"
 echo "  If your panel login page is https://example.com:2053/mywebbasepath/panel/xray"
-echo "  then enter only:           https://example.com:2053/mywebbasepath"
+echo "  then enter only: https://example.com:2053/mywebbasepath"
 echo "  Note: the panel can be on a different server — just use its full URL."
 echo ""
 
@@ -104,12 +104,32 @@ read -rp "  Allowed user IDs (comma-separated, e.g. 123456789,987654321): " ALLO
 # Build a Python list from the comma-separated IDs
 ALLOWED_LIST="[$(echo "$ALLOWED_RAW" | tr ',' '\n' | sed 's/[^0-9]//g' | tr '\n' ',' | sed 's/,$//')]"
 
+echo ""
+echo "  Detecting this server's public IP…"
+echo "  (used to reject candidates that would just loop back through this box)"
+DETECTED_IP="$(curl -fsSL --max-time 5 https://api.ipify.org || true)"
+if [ -n "$DETECTED_IP" ]; then
+    read -rp "  This server's public IP [$DETECTED_IP]: " SERVER_IP
+    SERVER_IP="${SERVER_IP:-$DETECTED_IP}"
+else
+    echo "  ⚠️  Could not auto-detect public IP."
+    read -rp "  Enter this server's public IP (leave blank to skip this check): " SERVER_IP
+fi
+
 sed -i "s|PANEL_BASE_URL = .*|PANEL_BASE_URL = \"$PANEL_URL\"|" "$CONFIG_FILE"
 sed -i "s|PANEL_USERNAME = .*|PANEL_USERNAME = \"$PANEL_USER\"|" "$CONFIG_FILE"
 sed -i "s|PANEL_PASSWORD = .*|PANEL_PASSWORD = \"$PANEL_PASS\"|" "$CONFIG_FILE"
 sed -i "s|BOT_TOKEN = .*|BOT_TOKEN = \"$BOT_TOKEN\"|" "$CONFIG_FILE"
 sed -i "s|ALLOWED_USERS = .*|ALLOWED_USERS = $ALLOWED_LIST|" "$CONFIG_FILE"
 sed -i "s|XRAY_BINARY = .*|XRAY_BINARY = \"$XRAY_BINARY\"|" "$CONFIG_FILE"
+
+# SERVER_IP — add the key if this is an older config.py that predates it
+grep -q "SERVER_IP" "$CONFIG_FILE" || cat >> "$CONFIG_FILE" << 'EOFCFG'
+
+# ---------- Server Identity ----------
+SERVER_IP = ""
+EOFCFG
+sed -i "s|SERVER_IP = .*|SERVER_IP = \"$SERVER_IP\"|" "$CONFIG_FILE"
 
 # Append extra settings if not present
 grep -q "XRAY_WORKERS" "$CONFIG_FILE" || cat >> "$CONFIG_FILE" << 'EOFCFG'
@@ -128,7 +148,6 @@ EOFCFG
 
 # ---------- systemd service ----------
 echo "[6/6] Installing systemd service…"
-
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=tg-xui-manager Telegram Bot
@@ -157,11 +176,12 @@ echo ""
 echo "  Xray binary : $XRAY_BINARY"
 echo "  Install dir : $INSTALL_DIR"
 echo "  Panel URL   : $PANEL_URL"
+echo "  Server IP   : ${SERVER_IP:-<not set>}"
 echo ""
 echo "Useful commands:"
-echo "  journalctl -u $SERVICE_NAME -f       # live logs"
-echo "  systemctl status $SERVICE_NAME        # service status"
-echo "  systemctl restart $SERVICE_NAME       # restart"
-echo "  systemctl stop $SERVICE_NAME          # stop"
-echo "  bash $INSTALL_DIR/update.sh           # update to latest version"
-echo "  bash $INSTALL_DIR/uninstall.sh        # remove everything"
+echo "  journalctl -u $SERVICE_NAME -f      # live logs"
+echo "  systemctl status $SERVICE_NAME       # service status"
+echo "  systemctl restart $SERVICE_NAME      # restart"
+echo "  systemctl stop $SERVICE_NAME         # stop"
+echo "  bash $INSTALL_DIR/update.sh          # update to latest version"
+echo "  bash $INSTALL_DIR/uninstall.sh       # remove everything"

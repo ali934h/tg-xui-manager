@@ -9,6 +9,14 @@ For each candidate outbound:
   5. Return the exit IP (real origin server IP, even for CDN-fronted configs)
   6. Terminate subprocess and clean up temp files
 
+A candidate is also rejected (returns None) if its exit IP:
+  - belongs to Cloudflare's published IP ranges (cf_ranges.py) - this
+    catches configs that are entirely served by a serverless/edge platform
+    rather than a real origin server, since the outbound connection never
+    actually leaves Cloudflare's network in that case; or
+  - matches this server's own public IP (config.SERVER_IP) - traffic would
+    just loop back through this box instead of reaching a distinct server.
+
 Returns None if the candidate fails for any reason.
 
 Xray binary: /usr/local/x-ui/bin/xray-linux-amd64 (installed by 3x-ui)
@@ -25,6 +33,7 @@ import subprocess
 import tempfile
 import time
 
+import cf_ranges
 import config
 
 logger = logging.getLogger(__name__)
@@ -63,7 +72,8 @@ def check_outbound(outbound: dict) -> str | None:
 
     Returns:
         str  - exit IP address on success
-        None - on any failure
+        None - on any failure, or if the exit IP is rejected (Cloudflare
+               range / this server's own IP)
     """
     if not os.path.exists(XRAY_BINARY):
         logger.error("Xray binary not found at %s", XRAY_BINARY)
@@ -71,9 +81,9 @@ def check_outbound(outbound: dict) -> str | None:
 
     socks_port = _free_port()
     xray_cfg = _build_xray_config(outbound, socks_port)
-
     tmp_cfg = None
     proc = None
+
     try:
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", delete=False, dir="/tmp"
@@ -86,7 +96,6 @@ def check_outbound(outbound: dict) -> str | None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-
         time.sleep(STARTUP_WAIT_SEC)
 
         if proc.poll() is not None:
@@ -106,16 +115,26 @@ def check_outbound(outbound: dict) -> str | None:
             timeout=REQUEST_TIMEOUT_SEC + 3,
         )
 
-        if result.returncode == 0:
-            exit_ip = result.stdout.strip()
-            if _is_valid_ip(exit_ip):
-                logger.info("Candidate OK - exit IP: %s", exit_ip)
-                return exit_ip
-            logger.debug("curl returned non-IP: %r", exit_ip)
-        else:
+        if result.returncode != 0:
             logger.debug("curl failed (code %s): %s", result.returncode, result.stderr.strip()[:100])
+            return None
 
-        return None
+        exit_ip = result.stdout.strip()
+        if not _is_valid_ip(exit_ip):
+            logger.debug("curl returned non-IP: %r", exit_ip)
+            return None
+
+        if cf_ranges.is_cloudflare_ip(exit_ip):
+            logger.info("Rejecting candidate - exit IP %s belongs to Cloudflare", exit_ip)
+            return None
+
+        server_ip = getattr(config, "SERVER_IP", "")
+        if server_ip and exit_ip == server_ip:
+            logger.info("Rejecting candidate - exit IP %s matches this server's own IP", exit_ip)
+            return None
+
+        logger.info("Candidate OK - exit IP: %s", exit_ip)
+        return exit_ip
 
     except Exception as e:
         logger.debug("check_outbound error: %s", e)

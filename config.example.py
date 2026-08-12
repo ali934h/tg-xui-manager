@@ -5,7 +5,6 @@
 # URL up to (but not including) /panel/xray
 # Example: https://example.com:2053/mypath
 PANEL_BASE_URL = "https://your-panel-url:port/webbasepath"
-
 PANEL_USERNAME = "your_username"
 PANEL_PASSWORD = "your_password"
 
@@ -20,8 +19,15 @@ BOT_TOKEN = "123456:ABC-your-bot-token"
 ALLOWED_USERS = [123456789]
 
 # ---------- Outbound Slot Tags ----------
-SLOT_TAG_PREFIX = "out"    # -> out01, out02, ...
+SLOT_TAG_PREFIX = "out"  # -> out01, out02, ...
 SLOT_TAG_DIGITS = 2
+
+# ---------- Server Identity ----------
+# This server's own public IP. Used by ipcheck.py to reject any candidate
+# whose real exit IP matches this box — otherwise traffic would just loop
+# back through this server instead of reaching a distinct one.
+# Auto-detected and filled in by install.sh; leave empty to disable this check.
+SERVER_IP = ""
 
 # ---------- Candidate Check ----------
 # XRAY_CHECK_ENABLED: use the local Xray binary to make a real HTTP request
